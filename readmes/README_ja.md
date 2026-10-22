@@ -6,7 +6,7 @@
   <p>Cloudflare Workers / EdgeOne Cloud Function / Alibaba Cloud ESA 上で動作します</p>
 
 <a href="https://github.com/OpenListTeam/OpenList-Worker/blob/main/LICENSE"><img src="https://img.shields.io/github/license/OpenListTeam/OpenList-Worker" alt="License" /></a>
-<a href="https://github.com/OpenListTeam/OpenList-Worker/actions/workflows/edgeone-artifact-guard.yml"><img src="https://img.shields.io/github/actions/workflow/status/OpenListTeam/OpenList-Worker/edgeone-artifact-guard.yml?branch=main" alt="Build status" /></a>
+<a href="https://github.com/OpenListTeam/OpenList-Worker/actions/workflows/build-verify.yml"><img src="https://img.shields.io/github/actions/workflow/status/OpenListTeam/OpenList-Worker/build-verify.yml?branch=main" alt="Build status" /></a>
 <a href="https://github.com/OpenListTeam/OpenList-Worker/releases"><img src="https://img.shields.io/github/release/OpenListTeam/OpenList-Worker" alt="latest version" /></a>
 <a href="https://github.com/OpenListTeam/OpenList-Worker/discussions"><img src="https://img.shields.io/github/discussions/OpenListTeam/OpenList-Worker?color=%23ED8936" alt="discussions" /></a>
 <a href="https://github.com/OpenListTeam/OpenList-Worker/releases"><img src="https://img.shields.io/github/downloads/OpenListTeam/OpenList-Worker/total?color=%239F7AEA&logo=github" alt="Downloads" /></a>
@@ -37,16 +37,15 @@
 
 | EdgeOne Makers · 国際版 | EdgeOne Makers · 中国版 | Cloudflare Workers · グローバル |
 | :---: | :---: | :---: |
-| [![EdgeOne にデプロイ](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://edgeone.ai/pages/new?project-name=openlist-tsworker&repository-url=https://github.com/OpenListTeam/OpenList-Worker&install-command=pnpm%20install%20--no-frozen-lockfile&build-command=pnpm%20run%20build&output-directory=dist&env=ENCRYPTION_SECRET,JWT_SECRET) | [![EdgeOne にデプロイ](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://console.cloud.tencent.com/edgeone/pages/new?project-name=openlist-tsworker&repository-url=https://github.com/OpenListTeam/OpenList-Worker&install-command=pnpm%20install%20--no-frozen-lockfile&build-command=pnpm%20run%20build&output-directory=dist&env=ENCRYPTION_SECRET,JWT_SECRET) | [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/OpenListTeam/OpenList-Worker) |
+| [![EdgeOne にデプロイ](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://edgeone.ai/pages/new?project-name=openlist-tsworker&repository-url=https://github.com/OpenListTeam/OpenList-Worker&install-command=pnpm%20install%20--no-frozen-lockfile&build-command=pnpm%20run%20build&output-directory=dist&env=JWT_SECRET) | [![EdgeOne にデプロイ](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://console.cloud.tencent.com/edgeone/pages/new?project-name=openlist-tsworker&repository-url=https://github.com/OpenListTeam/OpenList-Worker&install-command=pnpm%20install%20--no-frozen-lockfile&build-command=pnpm%20run%20build&output-directory=dist&env=JWT_SECRET) | [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/OpenListTeam/OpenList-Worker) |
 
 </div>
 
 > [!IMPORTANT]
 > - Cloudflare が `ストレージリポジトリの内容を取得できません` と表示する場合、まず本プロジェクトを [Fork](https://github.com/OpenListTeam/OpenList-Worker/fork) し、Github リポジトリへの接続からデプロイしてください
-> - デプロイ後、環境変数を設定します： **EdgeOne**：[国際版コンソール](https://console.edgeone.ai/makers) · [中国版コンソール](https://console.cloud.tencent.com/edgeone/makers)；**Cloudflare**：[Worker ダッシュボード](https://dash.cloudflare.com/)。環境変数：
->   - `DB_FORMAT`: データ保存形式：`map` (デフォルト、オブジェクト全体 JSON) / `key` (キー別保存) / `sql` (リレーショナルテーブル、Go バックエンド互換)
->   - `DB_DRIVER`: データベースドライバ：`auto` (デフォルト、自動検出) / `blob` / `cfkv` / `kv` / `d1` / `mysql`
->   - その他の任意変数は**詳細なデプロイガイド**を参照：[Cloudflare](https://doc.oplist.org/guide/installation/worker#deploy-to-cloudflare-workers) · [EdgeOne](https://doc.oplist.org/guide/installation/worker#deploy-to-edgeone) · [ESA](https://doc.oplist.org/guide/installation/worker#deploy-to-alibaba-cloud-esa)
+> - デプロイ時に `JWT_SECRET`（16 文字以上のランダム文字列、例：`openssl rand -hex 32`）を設定してください。JWT 署名とデータ暗号化に使われ、未設定の場合は初期化時に自動生成・永続化されます
+> - データ保存はプラットフォーム標準の永続化バックエンドを自動選択します（`DB_DRIVER=auto`）——通常は設定不要です。その他の変数は [環境変数](https://doc.oplist.org/ecosystem/official_worker/guide_env) を参照してください
+> - デプロイ後の初回アクセスでは**インストールウィザード**が開きます。ブラウザで管理者アカウントとパスワードを設定して初期化してください（`ADMIN_PASS` を設定するとウィザードをスキップできます）
 
 
 ## 機能紹介
@@ -61,7 +60,7 @@ OpenList-Worker は公式 [OpenListTeam/OpenList](https://github.com/OpenListTea
 
 - **国内クラウドドライブ**：アリババクラウドディスク（オープンプラットフォーム/共有）、Quark（オープンプラットフォーム/UC TV 版）、Baidu 網盤（アルバム）、115（オープンプラットフォーム/共有）、123 Pan（オープンプラットフォーム/共有）、天翼クラウドディスク（189/PC/TV）、中国移動クラウドディスク（139/和彩雲）、沃家クラウドディスク、迅雷クラウドディスク、Tencent Weiyun、Lanzou、PikPak（共有）、豆包、光亜盤、超星グループ、Lenovo NAS 共有、Teambition、WPS クラウド、アリババドキュメント、HalalCloud、MediaTrack など
 - **海外クラウドドライブ**：Google Drive（アルバム）、OneDrive（アプリ/共有リンク）、Dropbox、MEGA、MediaFire、Proton Drive、Yandex Disk、Degoo、Bunny Storage、TeraBox など
-- **オブジェクトストレージ**：S3 互換（AWS/OSS/COS/MinIO など）、UpYun USS、Azure Blob、WebDAV、FTP、SFTP、SMB、IPFS など
+- **オブジェクトストレージ**：S3 互換（AWS/OSS/COS/MinIO など）、Cloudflare R2（Workers バインディングまたは S3 API）、UpYun USS、Azure Blob、WebDAV、FTP、SFTP、SMB、IPFS など
 - **コードホスティング**：GitHub、GitHub Releases、CNB Releases
 - **クラウドドライブプログラム**：OpenList（共有）、AList V3、Cloudreve V3/V4、Kodbox、Seafile、Teldrive、Febbox など
 - **その他のドライバー**：Netease Music、Misskey、Emby、Cloudflare 画像ホスティングなど

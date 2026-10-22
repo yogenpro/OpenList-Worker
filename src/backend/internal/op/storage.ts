@@ -1,5 +1,16 @@
-import { resolvePath, getDb, saveDb } from "../model/db"
+import { resolvePath, getDb, getSettings, saveDb } from "../model/db"
+import { encodeDownloadPath } from "../../pkg/path"
+import { singleflight } from "../../pkg/singleflight"
+import { canUseProxyEndpoint, normalizeExtList } from "../driver/proxy"
 import { FileItem, StorageDriver, calcFileType } from "../driver/base"
+import {
+  getCachedFileTree,
+  setCachedFileTree,
+  getCachedLink,
+  setCachedLink,
+  invalidatePaths,
+  type CacheTarget,
+} from "../cache"
 import { Onedrive } from "../../drivers/onedrive/driver"
 import { OnedriveAPP } from "../../drivers/onedrive_app/driver"
 import { AliyundriveOpen } from "../../drivers/aliyundrive_open/driver"
@@ -42,12 +53,14 @@ import {
   ThunderExpertDriver,
 } from "../../drivers/thunder/driver"
 import { LanzouDriver } from "../../drivers/lanzou/driver"
+import { CtFileDriver } from "../../drivers/ctfile/driver"
 import { Cloud189Driver } from "../../drivers/189/driver"
 import { Driver189TV } from "../../drivers/189_tv/driver"
 import { WebdavDriver } from "../../drivers/webdav/driver"
 import { WoPanDriver, normalizeWoPanAddition } from "../../drivers/wopan/driver"
 import { MoPanDriver } from "../../drivers/mopan/driver"
 import { S3Driver, normalizeS3Addition } from "../../drivers/s3/driver"
+import { R2Driver } from "../../drivers/r2/driver"
 import {
   WeiyunDriver,
   normalizeWeiyunAddition,
@@ -122,6 +135,7 @@ async function getFTPDriver(storageConfig: any): Promise<StorageDriver> {
 const driverCache = new Map<string, StorageDriver>()
 const driverInitCache = new Map<string, Promise<StorageDriver>>()
 const cookiePersistenceCache = new Map<string, Promise<void>>()
+const deferredTokenPersistence = new WeakSet<object>()
 
 // M-8：驱动实例缓存容量上限。storage.modified 变化会产生新 key，旧条目若不清理，
 // 长生命周期 isolate 中会无限累积。超出上限时按插入顺序淘汰最旧条目。
@@ -138,6 +152,10 @@ function setDriverCache(key: string, driver: StorageDriver): void {
 export interface StorageRequestContext {
   waitUntil?: (promise: Promise<unknown>) => void
   env?: any // ESA/Cloudflare env，用于请求级缓存复用
+}
+
+export interface GetDriverOptions {
+  deferTokenPersistence?: boolean
 }
 
 export async function getOrCreateDriver(
@@ -224,6 +242,11 @@ async function createDriver(
               : st.addition || {}
           stAddition.refresh_token = refreshToken
           st.addition = JSON.stringify(stAddition)
+          // The admin update path persists updatedStorage after driver init.
+          // Keep that object in sync so its final save cannot restore the old
+          // refresh token over the rotated token saved here.
+          storageConfig.addition = st.addition
+          if (deferredTokenPersistence.has(storageConfig)) return
           await saveDb(db)
         } catch (e) {
           console.warn("[Onedrive] failed to persist refresh token:", e)
@@ -369,6 +392,7 @@ async function createDriver(
     await driver.init?.()
   } else if (
     normDriver === "quarktv" ||
+    normDriver === "quarkuctv" ||
     normDriver === "uctv" ||
     normDriver === "quark_uc_tv"
   ) {
@@ -699,6 +723,16 @@ async function createDriver(
     })
     await driver.init?.()
   } else if (
+    normDriver === "ctfile" ||
+    normDriver === "ctfilepan" ||
+    normDriver === "ctfiledriver" ||
+    normDriver === "400gb" ||
+    normDriver.includes("ctfile")
+  ) {
+    const addition = parseAddition(storageConfig)
+    driver = new CtFileDriver(addition)
+    await driver.init?.()
+  } else if (
     normDriver === "189tv" ||
     normDriver === "cloud189tv" ||
     normDriver === "189tvcloud" ||
@@ -743,13 +777,25 @@ async function createDriver(
     driver = new WebdavDriver(addition)
     await driver.init?.()
   } else if (
+    // Cloudflare R2 独立驱动（"Cloudflare R2" / "r2" / "cloudflare_r2" / "cfr2"
+    // 归一化后都会落到这里）。必须在下面的 S3 分支之前匹配。
+    normDriver === "r2" ||
+    normDriver === "cloudflarer2" ||
+    normDriver === "cfr2" ||
+    normDriver === "r2native"
+  ) {
+    const addition = parseAddition(storageConfig)
+    driver = new R2Driver(addition)
+    await driver.init?.()
+  } else if (
+    // S3 兼容家族。注意：`r2` 已由上一分支接管，这里不能再列它
+    // （会被上方分支拦截成死代码，且让「r2 走哪条路」变得难读）。
     normDriver === "s3" ||
     normDriver === "doge" ||
     normDriver === "dogecloud" ||
     normDriver === "minio" ||
     normDriver === "ceph" ||
     normDriver === "aws" ||
-    normDriver === "r2" ||
     normDriver === "b2" ||
     normDriver === "cos" ||
     normDriver === "oss" ||
@@ -975,7 +1021,28 @@ async function createDriver(
     normDriver.includes("139")
   ) {
     const addition = parseAddition(storageConfig)
-    driver = new Yun139Driver(addition)
+    driver = new Yun139Driver(addition, async (authorization) => {
+      try {
+        const db = await getDb()
+        const st = (db.storages || []).find(
+          (s: any) => s.id === storageConfig?.id,
+        )
+        if (!st) return
+        const stAddition =
+          typeof st.addition === "string"
+            ? JSON.parse(st.addition || "{}")
+            : st.addition || {}
+        stAddition.authorization = authorization
+        st.addition = JSON.stringify(stAddition)
+        // Keep the in-flight admin update object in sync so it cannot overwrite
+        // the newly refreshed authorization with the previous value.
+        storageConfig.addition = st.addition
+        if (deferredTokenPersistence.has(storageConfig)) return
+        await saveDb(db)
+      } catch (e) {
+        console.warn("[139] failed to persist refreshed authorization:", e)
+      }
+    })
     await driver.init?.()
   } else if (
     normDriver === "mega" ||
@@ -1143,7 +1210,7 @@ async function createDriver(
     await driver.init?.()
   } else if (normDriver === "guangyapan" || normDriver === "guangya") {
     const addition = parseAddition(storageConfig)
-    driver = new GuangYaPanDriver(addition, async (accessToken, refreshToken) => {
+    driver = new GuangYaPanDriver(addition, async (changes) => {
       try {
         const db = await getDb()
         const st = (db.storages || []).find(
@@ -1154,12 +1221,13 @@ async function createDriver(
           typeof st.addition === "string"
             ? JSON.parse(st.addition || "{}")
             : st.addition || {}
-        stAddition.access_token = accessToken
-        if (refreshToken) stAddition.refresh_token = refreshToken
+        // 合并需要持久化的字段（access_token/refresh_token/verification_id/
+        // captcha_token/send_code 等），空串用于显式清除一次性字段
+        Object.assign(stAddition, changes)
         st.addition = JSON.stringify(stAddition)
         await saveDb(db)
       } catch (e) {
-        console.warn("[GuangYaPan] failed to persist tokens:", e)
+        console.warn("[GuangYaPan] failed to persist changes:", e)
       }
     })
     await driver.init?.()
@@ -1175,29 +1243,43 @@ async function createDriver(
 export async function getDriver(
   driverName: string,
   storageConfig?: any,
+  options: GetDriverOptions = {},
 ): Promise<StorageDriver> {
-  const normDriver = (driverName || "").toLowerCase().replace(/[^a-z0-9]/g, "")
-  if (normDriver === "local") {
-    return createDriver(driverName, storageConfig)
+  const deferTokenPersistence = Boolean(
+    options.deferTokenPersistence &&
+      storageConfig &&
+      typeof storageConfig === "object",
+  )
+  if (deferTokenPersistence) deferredTokenPersistence.add(storageConfig)
+
+  try {
+    const normDriver = (driverName || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "")
+    if (normDriver === "local") {
+      return createDriver(driverName, storageConfig)
+    }
+
+    if (!storageConfig) {
+      throw new Error(
+        "failed get driver: storage config not found for driver " + driverName,
+      )
+    }
+
+    const cacheKey = `${storageConfig.id}_${storageConfig.modified}`
+    const cached = driverCache.get(cacheKey)
+    if (cached) return cached
+
+    return getOrCreateDriver(driverInitCache, cacheKey, async () => {
+      const ready = driverCache.get(cacheKey)
+      if (ready) return ready
+      const driver = await createDriver(driverName, storageConfig)
+      setDriverCache(cacheKey, driver)
+      return driver
+    })
+  } finally {
+    if (deferTokenPersistence) deferredTokenPersistence.delete(storageConfig)
   }
-
-  if (!storageConfig) {
-    throw new Error(
-      "failed get driver: storage config not found for driver " + driverName,
-    )
-  }
-
-  const cacheKey = `${storageConfig.id}_${storageConfig.modified}`
-  const cached = driverCache.get(cacheKey)
-  if (cached) return cached
-
-  return getOrCreateDriver(driverInitCache, cacheKey, async () => {
-    const ready = driverCache.get(cacheKey)
-    if (ready) return ready
-    const driver = await createDriver(driverName, storageConfig)
-    setDriverCache(cacheKey, driver)
-    return driver
-  })
 }
 
 function isCloud189Driver(driverName: string): boolean {
@@ -1304,27 +1386,90 @@ export async function flushPendingDriverState(
   await scheduleStoragePersistence(requestContext?.waitUntil, persistence)
 }
 
+/**
+ * 由 `resolvePath()` 结果构造缓存目标；虚拟路径（无存储）返回 null，
+ * 表示不参与缓存。
+ */
+function toCacheTarget(resolved: any): CacheTarget | null {
+  if (!resolved?.storage) return null
+  return {
+    storage: resolved.storage,
+    cleanPath: resolved.cleanPath,
+    physical: resolved.physical,
+    isVirtual: resolved.isVirtual,
+  }
+}
+
+/**
+ * fs 读操作的 singleflight 去重键。
+ *
+ * 组成：操作名 + 存储 id + 存储修订号 + 虚拟路径。
+ *   - 带存储 id/修订号：不同存储、以及存储配置被编辑后，不会复用旧结果；
+ *   - 带虚拟路径（调用方已做过 base_path 处理）：不会跨用户串味。
+ *
+ * 该键同时用于进程内（L1）与数据库表（L2）两级去重，因此必须稳定可复现：
+ * 绝不能包含时间戳、随机数、用户对象等每次调用都不同的内容。
+ */
+function fsSingleflightKey(
+  op: string,
+  resolved: any,
+  virtualPath: string,
+): string {
+  const storageId = resolved?.storage?.id ?? "virtual"
+  const revision = resolved?.storage?.modified ?? ""
+  return `${op}:${storageId}:${revision}:${virtualPath}`
+}
+
 export async function listItems(
   virtualPath: string,
   requestContext?: StorageRequestContext,
 ): Promise<{ content: FileItem[]; provider: string; storage?: any }> {
   const resolved = await resolvePath(virtualPath, requestContext?.env)
+  // 并发相同的「同一存储 + 同一目录」只向上游发起一次 list。
+  // 键必须在 resolvePath 之后才能确定（需要存储 id），因此去重发生在路径解析之后。
+  return singleflight(
+    fsSingleflightKey("fs.list", resolved, virtualPath),
+    () => listItemsResolved(resolved, virtualPath, requestContext),
+    { env: requestContext?.env },
+  )
+}
+
+async function listItemsResolved(
+  resolved: Awaited<ReturnType<typeof resolvePath>>,
+  virtualPath: string,
+  requestContext?: StorageRequestContext,
+): Promise<{ content: FileItem[]; provider: string; storage?: any }> {
   let items: FileItem[] = []
   let driverName = "Virtual"
 
   if (resolved.storage) {
     driverName = resolved.storage.driver
+    const cacheTarget = toCacheTarget(resolved)
     try {
-      const driver = await getDriver(driverName, resolved.storage)
-      // Get raw items from driver
-      try {
-        items = await driver.list(virtualPath, resolved.physical!)
-      } finally {
-        await flushPendingDriverState(
-          driverName,
-          resolved.storage,
-          driver,
-          requestContext,
+      // 文件树缓存：命中则完全跳过驱动（对齐 OpenList.ts「浏览只读缓存」）。
+      // 注意缓存的是驱动层原始结果，权限/meta/签名仍在 server 层按请求计算。
+      const cached = await getCachedFileTree(cacheTarget!, requestContext?.env)
+      if (cached) {
+        items = cached
+      } else {
+        const driver = await getDriver(driverName, resolved.storage)
+        // Get raw items from driver
+        try {
+          items = await driver.list(virtualPath, resolved.physical!)
+        } finally {
+          await flushPendingDriverState(
+            driverName,
+            resolved.storage,
+            driver,
+            requestContext,
+          )
+        }
+        // 回源成功后写入缓存（空目录同样缓存，避免反复击穿存储）。
+        // 传副本：后续 mount 合并 / type 计算会就地修改 items。
+        await setCachedFileTree(
+          cacheTarget!,
+          items.map((item) => ({ ...item })),
+          requestContext?.env,
         )
       }
       if (resolved.storage.status !== "work") {
@@ -1362,7 +1507,19 @@ export async function listItems(
   const activeStorages = (db.storages || []).filter((s: any) => !s.disabled)
   const cleanListedPath = resolved.cleanPath
 
-  activeStorages.forEach((s: any) => {
+  // 挂载点顺序对齐 Go op.getStorageVirtualFilesByPath：
+  //   Order 升序；Order 相同时按 MountPath 升序。
+  // 此前直接沿用数据库数组顺序，后台存储编辑页里的「序号」因此完全不生效。
+  const orderedStorages = [...activeStorages].sort((a: any, b: any) => {
+    const orderA = Number(a.order) || 0
+    const orderB = Number(b.order) || 0
+    if (orderA !== orderB) return orderA - orderB
+    const mountA = String(a.mount_path || "")
+    const mountB = String(b.mount_path || "")
+    return mountA < mountB ? -1 : mountA > mountB ? 1 : 0
+  })
+
+  orderedStorages.forEach((s: any) => {
     const mount =
       "/" + (s.mount_path || "").split("/").filter(Boolean).join("/")
     if (mount === cleanListedPath || mount === "/") return
@@ -1393,11 +1550,57 @@ export async function listItems(
   return { content: items, provider: driverName, storage: resolved.storage }
 }
 
+/**
+ * raw_url 使用哪个端点前缀（`/api/p` 还是 `/api/d`）。
+ *
+ * Go 的 `/p` 在取链接前先跑 `canProxy()`，不通过直接 403 `proxy not allowed`；
+ * `/d` 不受该限制（走 `ShouldProxy`）。因此 raw_url 必须与存储自身的代理配置匹配：
+ * 拿 `/p` 去请求一个既没开 `web_proxy`、扩展名也不在 `proxy_types` / `text_types`
+ * 里的存储，必然 403。
+ *
+ * 这是 #66 修复后暴露的第二个问题：文件列表走 `/d` 所以正常，而预览页的「下载」
+ * 按钮与 `img/video` 的 src 用的是 raw_url（此前恒为 `/api/p`）。
+ */
+async function resolveRawUrlPrefix(
+  storage: any,
+  virtualPath: string,
+): Promise<string> {
+  try {
+    const settings: Record<string, any> = await getSettings().catch(
+      () => ({}) as Record<string, any>,
+    )
+    const allowProxy = canUseProxyEndpoint({
+      storage,
+      driver: storage?.driver || "",
+      filename: virtualPath,
+      proxyTypes: normalizeExtList(settings.proxy_types),
+      textTypes: normalizeExtList(settings.text_types),
+    })
+    return allowProxy ? "/api/p" : "/api/d"
+  } catch {
+    // 设置读不到时保持旧行为（/p），由 rawRouter 给出最终结论
+    return "/api/p"
+  }
+}
+
 export async function getItem(
   virtualPath: string,
   requestContext?: StorageRequestContext,
 ): Promise<{ item: FileItem; provider: string; rawUrl: string }> {
   const resolved = await resolvePath(virtualPath, requestContext?.env)
+  // 与 listItems 同理：并发相同的「同一存储 + 同一路径」只向上游取一次元信息。
+  return singleflight(
+    fsSingleflightKey("fs.get", resolved, virtualPath),
+    () => getItemResolved(resolved, virtualPath, requestContext),
+    { env: requestContext?.env },
+  )
+}
+
+async function getItemResolved(
+  resolved: Awaited<ReturnType<typeof resolvePath>>,
+  virtualPath: string,
+  requestContext?: StorageRequestContext,
+): Promise<{ item: FileItem; provider: string; rawUrl: string }> {
   if (resolved.isVirtual) {
     const name = resolved.cleanPath.split("/").filter(Boolean).pop() || "root"
     return {
@@ -1428,22 +1631,30 @@ export async function getItem(
         raw_url: "",
       },
       provider: resolved.storage.driver,
-      rawUrl: `/api/p${virtualPath.startsWith("/") ? "" : "/"}${virtualPath}`,
+      rawUrl: `${await resolveRawUrlPrefix(resolved.storage, virtualPath)}${encodeDownloadPath(virtualPath)}`,
     }
   }
 
   const driverName = resolved.storage ? resolved.storage.driver : "Local"
-  const driver = await getDriver(driverName, resolved.storage)
-  let item: FileItem
-  try {
-    item = await driver.get(virtualPath, resolved.physical!)
-  } finally {
-    await flushPendingDriverState(
-      driverName,
-      resolved.storage,
-      driver,
-      requestContext,
-    )
+  const cacheTarget = toCacheTarget(resolved)
+  // 下载链接缓存：命中则直接复用上次换取到的直链与元数据，
+  // 跳过驱动 get()（网盘换链通常是最贵、最易被限流的一步）。
+  let item: FileItem | null = cacheTarget
+    ? await getCachedLink(cacheTarget, requestContext?.env)
+    : null
+  if (!item) {
+    const driver = await getDriver(driverName, resolved.storage)
+    try {
+      item = await driver.get(virtualPath, resolved.physical!)
+    } finally {
+      await flushPendingDriverState(
+        driverName,
+        resolved.storage,
+        driver,
+        requestContext,
+      )
+    }
+    await setCachedLink(cacheTarget, item, requestContext?.env)
   }
   if (!item.type) {
     item.type = calcFileType(item.name, item.is_dir)
@@ -1451,7 +1662,11 @@ export async function getItem(
   return {
     item,
     provider: driverName,
-    rawUrl: `/api/p${virtualPath.startsWith("/") ? "" : "/"}${virtualPath}`,
+    // 端点前缀按 canProxy() 选（见 resolveRawUrlPrefix），路径必须逐段编码
+    // （对齐 Go utils.EncodePath(path, true)）：raw_url 会被前端直接当 href/src
+    // 使用，未编码的 `?`/`#` 会被截断、裸 `%` 会让服务端 decodeURIComponent 抛错
+    // （见 pkg/path.encodeDownloadPath 注释）。
+    rawUrl: `${await resolveRawUrlPrefix(resolved.storage, virtualPath)}${encodeDownloadPath(virtualPath)}`,
   }
 }
 
@@ -1474,6 +1689,8 @@ export async function makeDirectory(
       requestContext,
     )
   }
+  // 新建目录：父目录列表已变化（目录自身也为空列表）
+  await invalidatePaths([virtualPath], requestContext?.env)
 }
 
 export async function renameItem(
@@ -1496,6 +1713,10 @@ export async function renameItem(
       requestContext,
     )
   }
+  // 重命名：旧路径与新路径都要失效（父目录列表同样变化）
+  const parent = virtualPath.slice(0, virtualPath.lastIndexOf("/")) || "/"
+  const newVirtualPath = `${parent === "/" ? "" : parent}/${newName}`
+  await invalidatePaths([virtualPath, newVirtualPath], requestContext?.env)
 }
 
 export async function removeItems(
@@ -1520,6 +1741,8 @@ export async function removeItems(
         requestContext,
       )
     }
+    // 删除：被删路径与其父目录缓存失效
+    await invalidatePaths([itemVirtual], requestContext?.env)
   }
 }
 
@@ -1558,6 +1781,8 @@ export async function moveItems(
         requestContext,
       )
     }
+    // 移动：源路径与目标路径（含各自父目录）缓存全部失效
+    await invalidatePaths([srcVirtual, dstVirtual], requestContext?.env)
   }
 }
 
@@ -1596,6 +1821,8 @@ export async function copyItems(
         requestContext,
       )
     }
+    // 复制：目标路径（含父目录）缓存失效
+    await invalidatePaths([dstVirtual], requestContext?.env)
   }
 }
 
@@ -1619,4 +1846,6 @@ export async function putItem(
       requestContext,
     )
   }
+  // 上传/覆盖：该文件的旧直链与父目录列表缓存失效
+  await invalidatePaths([virtualPath], requestContext?.env)
 }

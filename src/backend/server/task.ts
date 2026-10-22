@@ -8,7 +8,7 @@ export const taskRouter = new Hono()
 // 定时任务调度接口：刷新所有已启用网盘驱动的 Token / 状态并持久化
 // 仅管理员可触发（防止未授权用户探测存储配置/触发资源消耗）。
 // EdgeOne Schedules 等平台调度器无法附加 Authorization 头，
-// 因此在设置环境变量 CRON_SECRET 后，调度请求可携带该密钥
+// 因此复用 JWT_SECRET 作为调度密钥，调度请求可携带该密钥
 //（JSON body / query / X-Cron-Secret 头）通过 matchCronSecret 放行。
 taskRouter.all(
   "/refresh",
@@ -27,11 +27,12 @@ taskRouter.all(
       try {
         const driver = await getDriver(s.driver, s)
         await driver.init?.()
-        // lanzou 驱动：主动校验 Cookie 是否过期（有效期约 15 天），
+        // lanzou / ctfile 驱动：主动校验凭证是否过期
+        // （lanzou Cookie 约 15 天；ctfile 开放接口 Session 失效返回 401），
         // 失效时标记 status=cookie_expired，管理后台可直接看到提示
         if (
           typeof (driver as any).checkCookieValid === "function" &&
-          /lanzou/i.test(String(s.driver))
+          /(lanzou|ctfile|400gb)/i.test(String(s.driver))
         ) {
           const check = await (driver as any).checkCookieValid()
           if (!check.valid) {

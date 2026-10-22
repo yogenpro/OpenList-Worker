@@ -6,7 +6,7 @@
   <p>基于 Cloudflare Workers / EdgeOne Cloud Function / Alibaba Cloud ESA 运行</p>
 
 <a href="https://github.com/OpenListTeam/OpenList-Worker/blob/main/LICENSE"><img src="https://img.shields.io/github/license/OpenListTeam/OpenList-Worker" alt="License" /></a>
-<a href="https://github.com/OpenListTeam/OpenList-Worker/actions/workflows/edgeone-artifact-guard.yml"><img src="https://img.shields.io/github/actions/workflow/status/OpenListTeam/OpenList-Worker/edgeone-artifact-guard.yml?branch=main" alt="Build status" /></a>
+<a href="https://github.com/OpenListTeam/OpenList-Worker/actions/workflows/build-verify.yml"><img src="https://img.shields.io/github/actions/workflow/status/OpenListTeam/OpenList-Worker/build-verify.yml?branch=main" alt="Build status" /></a>
 <a href="https://github.com/OpenListTeam/OpenList-Worker/releases"><img src="https://img.shields.io/github/release/OpenListTeam/OpenList-Worker" alt="latest version" /></a>
 <a href="https://github.com/OpenListTeam/OpenList-Worker/discussions"><img src="https://img.shields.io/github/discussions/OpenListTeam/OpenList-Worker?color=%23ED8936" alt="discussions" /></a>
 <a href="https://github.com/OpenListTeam/OpenList-Worker/releases"><img src="https://img.shields.io/github/downloads/OpenListTeam/OpenList-Worker/total?color=%239F7AEA&logo=github" alt="Downloads" /></a>
@@ -37,16 +37,15 @@
 
 | EdgeOne Makers · 国际站 | EdgeOne Makers · 中国站 | Cloudflare Workers · 全球站 |
 | :---: | :---: | :---: |
-| [![使用 EdgeOne 部署](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://edgeone.ai/pages/new?project-name=openlist-tsworker&repository-url=https://github.com/OpenListTeam/OpenList-Worker&install-command=pnpm%20install%20--no-frozen-lockfile&build-command=pnpm%20run%20build&output-directory=dist&env=ENCRYPTION_SECRET,JWT_SECRET) | [![使用 EdgeOne 部署](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://console.cloud.tencent.com/edgeone/pages/new?project-name=openlist-tsworker&repository-url=https://github.com/OpenListTeam/OpenList-Worker&install-command=pnpm%20install%20--no-frozen-lockfile&build-command=pnpm%20run%20build&output-directory=dist&env=ENCRYPTION_SECRET,JWT_SECRET) | [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/OpenListTeam/OpenList-Worker) |
+| [![使用 EdgeOne 部署](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://edgeone.ai/pages/new?project-name=openlist-tsworker&repository-url=https://github.com/OpenListTeam/OpenList-Worker&install-command=pnpm%20install%20--no-frozen-lockfile&build-command=pnpm%20run%20build&output-directory=dist&env=JWT_SECRET) | [![使用 EdgeOne 部署](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://console.cloud.tencent.com/edgeone/pages/new?project-name=openlist-tsworker&repository-url=https://github.com/OpenListTeam/OpenList-Worker&install-command=pnpm%20install%20--no-frozen-lockfile&build-command=pnpm%20run%20build&output-directory=dist&env=JWT_SECRET) | [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/OpenListTeam/OpenList-Worker) |
 
 </div>
 
 > [!IMPORTANT]
-> - 若Cloudflare提示`无法获取存储库内容`，则您需要先[Fork](https://github.com/OpenListTeam/OpenList-Worker/fork)本项目，再通过连接到Github仓库功能部署
-> - 部署完成后配置环境变量： **EdgeOne**：[国际站](https://console.edgeone.ai/makers) · [中国站](https://console.cloud.tencent.com/edgeone/makers)；**Cloudflare**：[Worker 后台](https://dash.cloudflare.com/)，环境变量：
->   - `DB_FORMAT`: 数据存储格式：`map` (默认，整对象JSON) / `key` (分key存储) / `sql` (关系表，与Go后端一致)
->   - `DB_DRIVER`: 数据库驱动：`auto` (默认，自动检测) / `blob` (EdgeOne Blob) / `cfkv` (CF KV API) / `kv` (KV binding) / `d1` (Cloudflare D1) / `mysql`
->   - 其余可选变量参考**详细部署指南**：[Cloudflare](https://doc.oplist.org/guide/installation/worker#deploy-to-cloudflare-workers) · [EdgeOne](https://doc.oplist.org/guide/installation/worker#deploy-to-edgeone) · [ESA](https://doc.oplist.org/guide/installation/worker#deploy-to-alibaba-cloud-esa)
+> - 若 Cloudflare 提示`无法获取存储库内容`，则您需要先 [Fork](https://github.com/OpenListTeam/OpenList-Worker/fork) 本项目，再通过连接到 Github 仓库功能部署
+> - 部署时请填写 `JWT_SECRET`（≥16 字符的随机串，可用 `openssl rand -hex 32` 生成）：它用于 JWT 签名与数据加密；未配置时会在初始化时自动生成并持久化
+> - 数据存储默认自动选择平台自带的持久化后端（`DB_DRIVER=auto`），无需配置；其余变量见 [配置变量](https://doc.oplist.org/ecosystem/official_worker/guide_env)
+> - 部署完成后首次访问站点，按**安装向导**在浏览器中设置管理员账号与密码即可完成初始化；如需跳过向导，可配置 `ADMIN_PASS`
 
 
 ## 功能简介
@@ -59,9 +58,9 @@ OpenList-Worker 是官方 [OpenListTeam/OpenList](https://github.com/OpenListTea
 
 内置 **78 个存储驱动**，开箱即用地挂载各类存储后端：
 
-- **国内网盘**：阿里云盘（开放平台/分享）、夸克网盘（开放平台/UC TV 版）、百度网盘（相册）、115 网盘（开放平台/分享）、123 云盘（开放平台/分享）、天翼云盘（189/PC/TV）、中国移动云盘（139/和彩云）、沃家云盘、迅雷云盘、腾讯微云、蓝奏云、PikPak（分享）、豆包网盘、光亚盘、超星小组网盘、联想 NAS 分享、Teambition 网盘、WPS 网盘、阿里文档、HalalCloud、MediaTrack 等
+- **国内网盘**：阿里云盘（开放平台/分享）、夸克网盘（开放平台/UC TV 版）、百度网盘（相册）、115 网盘（开放平台/分享）、123 云盘（开放平台/分享）、天翼云盘（189/PC/TV）、中国移动云盘（139/和彩云）、沃家云盘、迅雷云盘、腾讯微云、蓝奏云、城通网盘、PikPak（分享）、豆包网盘、光亚盘、超星小组网盘、联想 NAS 分享、Teambition 网盘、WPS 网盘、阿里文档、HalalCloud、MediaTrack 等
 - **国际网盘**：Google Drive（相册）、OneDrive（应用/分享链接）、Dropbox、MEGA、MediaFire、Proton Drive、Yandex Disk、Degoo、Bunny Storage、TeraBox 等
-- **对象存储**：S3 兼容（AWS/OSS/COS/MinIO 等）、又拍云 USS、Azure Blob、WebDAV、FTP、SFTP、SMB、IPFS 等
+- **对象存储**：S3 兼容（AWS/OSS/COS/MinIO 等）、Cloudflare R2（Workers Binding 直连或 S3 API）、又拍云 USS、Azure Blob、WebDAV、FTP、SFTP、SMB、IPFS 等
 - **代码托管**：GitHub、GitHub Releases、CNB Releases
 - **网盘程序**：OpenList（分享）、AList V3、Cloudreve V3/V4、Kodbox（可道云）、Seafile、Teldrive、Febbox 等
 - **其他驱动**：网易云音乐、Misskey、Emby、Cloudflare 图床等
@@ -77,6 +76,7 @@ OpenList-Worker 是官方 [OpenListTeam/OpenList](https://github.com/OpenListTea
 - **离线任务**：后台任务队列，支持批量操作与异步处理。
 - **外部接口**：将聚合存储以 WebDAV 或 S3 兼容协议对外暴露，便于挂载到第三方工具。
 - **MCP 服务**：提供 Model Context Protocol 端点，可被 AI 助手等客户端集成调用。
+- **并发去重**：同一时刻相同的目录列表 / 元信息请求只向上游网盘发起一次，其余请求复用同一结果，避免无谓的限流与 CPU 消耗。
 
 ### 权限管理
 
@@ -87,10 +87,9 @@ OpenList-Worker 是官方 [OpenListTeam/OpenList](https://github.com/OpenListTea
 
 ### 平台部署
 
-- **运行平台**：Cloudflare Workers、腾讯云 EdgeOne Makers、Vercel、Serverless  及 Node.js 容器环境。
-- **数据存储**：Cloudflare D1（SQLite）为主，同时支持 MySQL、MariaDB、PostgreSQL、SQL Server。
-- **持久缓存**：Cloudflare KV / EdgeOne Blob（可选），用于配置持久化与缓存。
-- **一键部署**：支持 EdgeOne、Cloudflare Workers 等平台的一键部署按钮+初始化。
+- **运行平台**：Cloudflare Workers、腾讯云 EdgeOne Makers、阿里云 ESA、Vercel / AWS Lambda 及 Node.js 容器环境。
+- **数据存储**：Cloudflare D1（SQLite）为主，也支持 KV / Blob / Durable Objects 与外部 MySQL / MariaDB。
+- **一键部署**：支持 EdgeOne、Cloudflare Workers 的一键部署按钮 + 安装向导。
 
 ---
 
@@ -107,7 +106,7 @@ OpenList-Worker 是官方 [OpenListTeam/OpenList](https://github.com/OpenListTea
 # 1. 安装依赖
 pnpm install
 
-# 2. 配置 wrangler.toml（填写 JWT_SECRET、KV/D1 绑定）
+# 2. 按需配置 wrangler.jsonc 中的绑定与变量（JWT_SECRET 见 .dev.vars.example）
 
 # 3. 启动开发服务器（自动拉取官方前端并运行 Worker）
 pnpm run dev:unified
@@ -119,10 +118,10 @@ pnpm run dev:worker
 ### 生产部署
 
 ```bash
-# 一键部署：确保 KV namespace 存在 → 拉取官方前端 → 部署到 Cloudflare Workers
+# 一键部署：构建前端产物 → 部署到 Cloudflare Workers（KV 绑定由 wrangler 自动预配）
 pnpm run deploy
 
-# 或直接部署 Worker（跳过 KV 检查与前端构建）
+# 或直接部署 Worker（跳过前端构建）
 pnpm run deploy:worker
 ```
 
@@ -132,17 +131,16 @@ pnpm run deploy:worker
 
 ### 后端
 
-- **运行环境**：Cloudflare Workers（Edge Computing）
+- **运行环境**：Cloudflare Workers / EdgeOne 云函数 / 阿里云 ESA（Edge Computing）
 - **Web 框架**：Hono.js
-- **数据库**：Cloudflare D1（SQLite）/ 支持 MySQL、MariaDB、PostgreSQL、SQL Server
-- **缓存**：Cloudflare KV（可选）
+- **数据库**：Cloudflare D1（SQLite）/ KV / Blob / Durable Objects，或外部 MySQL / MariaDB
 - **语言**：TypeScript
 - **构建工具**：Wrangler、esbuild
 
 ### 前端
 
-- **框架**：React 19 + TypeScript
-- **UI 库**：Ant Design / Material-UI
+- **框架**：SolidJS + TypeScript（官方 [OpenList-Frontend](https://github.com/OpenListTeam/OpenList-Frontend)）
+- **UI 库**：Hope UI
 - **构建工具**：Vite
 
 ---
@@ -150,75 +148,34 @@ pnpm run deploy:worker
 
 ## 配置
 
-### 环境变量
+部署完成后**首次访问站点会自动进入安装向导**，在浏览器中设置管理员账号与密码即可完成初始化；如需跳过向导，配置 `ADMIN_PASS` 即可自动初始化 admin。
 
-#### 数据库配置
+绝大多数部署**不需要任何额外配置**：数据存储默认走 `DB_DRIVER=auto`，会自动选择平台可用的持久化后端（Cloudflare Workers → KV / D1 / DO，EdgeOne / ESA → Blob）。建议显式配置的只有一项：
 
-**DB_FORMAT**（数据存储格式）
-- `map`（默认）：整对象 JSON 格式，适用于 KV/Blob 等简单存储
-- `key`：分 key 存储格式，每个实体一条记录（如 `openlist_tbl:users:1`），避免大 JSON
-- `sql`：关系数据库表格式，与 Go 后端完全一致，适用于 D1/MySQL
+| 变量 | 说明 |
+| :--- | :--- |
+| `JWT_SECRET` | JWT 令牌签名密钥（≥16 字符，推荐 `openssl rand -hex 32` 生成），同时用于定时任务鉴权。未配置时会在初始化时自动生成并持久化 |
 
-**DB_DRIVER**（数据库驱动）
-- `auto`（默认）：自动检测可用驱动（优先级：blob → cfkv → kv → d1）
-- `blob`：腾讯云 EdgeOne Blob / 阿里云 ESA Blob
-- `cfkv`：Cloudflare KV REST API（需配置 `CF_ACCOUNT_ID`、`CF_KV_NAMESPACE_ID`、`CF_API_TOKEN`）
-- `kv`：Cloudflare KV binding
-- `d1`：Cloudflare D1（SQLite）
-- `mysql`：MySQL / PostgreSQL（仅 Node.js 容器）
+> `JWT_SECRET` 请以 **Secret**（而非普通变量）方式配置：普通变量可能在平台重新部署时被仓库内的配置覆盖，Secret 不会被覆盖。
 
-**推荐配置组合：**
-```bash
-# Cloudflare Workers + D1（推荐）
-DB_FORMAT=sql
-DB_DRIVER=d1
+其余变量均有合理默认值，需要时再调整：
 
-# EdgeOne + Blob
-DB_FORMAT=map
-DB_DRIVER=blob
+| 变量 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `ADMIN_PASS` | — | 跳过安装向导，以该密码自动初始化 admin |
+| `DB_FORMAT` | `map` | 数据存储格式：`map`（整对象 JSON）/ `key`（分 key）/ `sql`（关系表，与 Go 后端一致） |
+| `DB_DRIVER` | `auto` | 存储驱动：`auto` / `blob` / `cfkv` / `kv` / `d1` / `do` / `mysql`；显式指定后不做回退 |
+| `DB_CIPHER` | `none` | 敏感字段落盘算法（默认不加密），如 `aes-256-gcm` |
+| `CACHE_ENABLED` / `CACHE_DRIVER` | `true` / `db` | 文件树缓存与下载链接缓存，默认复用业务数据后端 |
+| `ALLOW_URLS` | — | CORS 允许白名单（逗号分隔，不设则仅同源） |
+| `MAX_UPLOAD` / `MAX_UPPART` | 26214400 / 16777216 | 整体上传 / 分片上传大小上限（字节） |
+| `ASSET_URLS` | — | 前端静态资源 CDN 地址，支持 `$version` 占位符 |
 
-# Cloudflare KV（高频读写）
-DB_FORMAT=key
-DB_DRIVER=kv
+完整环境变量（含缓存 `CACHE_*`、字段加密 `DB_CIPHER`、并发去重 `SINGLEFLIGHT`、`cfkv` / MySQL 连接配置等）与各平台部署步骤，请参阅文档站：
 
-# 远程访问 Cloudflare KV
-DB_FORMAT=key
-DB_DRIVER=cfkv
-CF_ACCOUNT_ID=your_account_id
-CF_KV_NAMESPACE_ID=your_namespace_id
-CF_API_TOKEN=your_api_token
-```
-
-**向后兼容：**
-- `DB_DRIVER=json` 自动转换为 `DB_FORMAT=map` + 自动检测驱动
-- `DB_JSON_BACKEND` 已废弃，会自动转换为 `DB_DRIVER`
-
-**表名对齐（仅 SQL 格式）：**
-`sql` 格式采用列式表，命名策略与 Go 后端的 GORM 一致（snake_case + 复数表名 + 前缀）：
-
-| Go 结构体     | 表名                |
-| :------------ | :------------------ |
-| `SettingItem` | `x_setting_items`   |
-| `SharingDB`   | `x_sharing_dbs`     |
-| `Storage`     | `x_storages`        |
-| `User`        | `x_users`           |
-| `Meta`        | `x_metas`           |
-| （仅 TS）     | `x_plugins`         |
-
-前缀默认为 `x_`，由 `TABLE_PREFIX` 环境变量控制（与 Go 后端一致）。要与 Go 后端共享同一物理数据库，保持默认值即可。
-
-#### 安全配置
-
-- `ENCRYPTION_SECRET`：数据加密密钥（必填）
-- `JWT_SECRET`：JWT 令牌签名密钥（必填）
-- `ADMIN_PASSWORD`：初始管理员密码
-
-#### 其他配置
-
-详细配置说明请参考 [官方文档](https://doc.oplist.org/guide/configuration)
-
----
-
+- [配置变量](https://doc.oplist.org/ecosystem/official_worker/guide_env)
+- [部署教程](https://doc.oplist.org/ecosystem/official_worker/guide)
+- [常见问题](https://doc.oplist.org/ecosystem/official_worker/about)
 
 ## 帮助支持
 
