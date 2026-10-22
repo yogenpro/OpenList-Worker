@@ -6,7 +6,7 @@
   <p>Работает на Cloudflare Workers / EdgeOne Cloud Function / Alibaba Cloud ESA</p>
 
 <a href="https://github.com/OpenListTeam/OpenList-Worker/blob/main/LICENSE"><img src="https://img.shields.io/github/license/OpenListTeam/OpenList-Worker" alt="License" /></a>
-<a href="https://github.com/OpenListTeam/OpenList-Worker/actions/workflows/edgeone-artifact-guard.yml"><img src="https://img.shields.io/github/actions/workflow/status/OpenListTeam/OpenList-Worker/edgeone-artifact-guard.yml?branch=main" alt="Build status" /></a>
+<a href="https://github.com/OpenListTeam/OpenList-Worker/actions/workflows/build-verify.yml"><img src="https://img.shields.io/github/actions/workflow/status/OpenListTeam/OpenList-Worker/build-verify.yml?branch=main" alt="Build status" /></a>
 <a href="https://github.com/OpenListTeam/OpenList-Worker/releases"><img src="https://img.shields.io/github/release/OpenListTeam/OpenList-Worker" alt="latest version" /></a>
 <a href="https://github.com/OpenListTeam/OpenList-Worker/discussions"><img src="https://img.shields.io/github/discussions/OpenListTeam/OpenList-Worker?color=%23ED8936" alt="discussions" /></a>
 <a href="https://github.com/OpenListTeam/OpenList-Worker/releases"><img src="https://img.shields.io/github/downloads/OpenListTeam/OpenList-Worker/total?color=%239F7AEA&logo=github" alt="Downloads" /></a>
@@ -37,16 +37,15 @@
 
 | EdgeOne Makers · Международный | EdgeOne Makers · Китай | Cloudflare Workers · Глобальный |
 | :---: | :---: | :---: |
-| [![Развернуть на EdgeOne](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://edgeone.ai/pages/new?project-name=openlist-tsworker&repository-url=https://github.com/OpenListTeam/OpenList-Worker&install-command=pnpm%20install%20--no-frozen-lockfile&build-command=pnpm%20run%20build&output-directory=dist&env=ENCRYPTION_SECRET,JWT_SECRET) | [![Развернуть на EdgeOne](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://console.cloud.tencent.com/edgeone/pages/new?project-name=openlist-tsworker&repository-url=https://github.com/OpenListTeam/OpenList-Worker&install-command=pnpm%20install%20--no-frozen-lockfile&build-command=pnpm%20run%20build&output-directory=dist&env=ENCRYPTION_SECRET,JWT_SECRET) | [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/OpenListTeam/OpenList-Worker) |
+| [![Развернуть на EdgeOne](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://edgeone.ai/pages/new?project-name=openlist-tsworker&repository-url=https://github.com/OpenListTeam/OpenList-Worker&install-command=pnpm%20install%20--no-frozen-lockfile&build-command=pnpm%20run%20build&output-directory=dist&env=JWT_SECRET) | [![Развернуть на EdgeOne](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://console.cloud.tencent.com/edgeone/pages/new?project-name=openlist-tsworker&repository-url=https://github.com/OpenListTeam/OpenList-Worker&install-command=pnpm%20install%20--no-frozen-lockfile&build-command=pnpm%20run%20build&output-directory=dist&env=JWT_SECRET) | [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/OpenListTeam/OpenList-Worker) |
 
 </div>
 
 > [!IMPORTANT]
 > - Если Cloudflare отображает `не удаётся получить содержимое репозитория`, сначала [сделайте fork](https://github.com/OpenListTeam/OpenList-Worker/fork) этого проекта, а затем разверните, подключившись к репозиторию Github
-> - После развёртывания настройте переменные окружения: **EdgeOne**: [Международная консоль](https://console.edgeone.ai/makers) · [Консоль Китая](https://console.cloud.tencent.com/edgeone/makers); **Cloudflare**: [Панель Worker](https://dash.cloudflare.com/). Переменные окружения:
->   - `DB_FORMAT`: формат хранения данных: `map` (по умолчанию, JSON всего объекта) / `key` (хранение по ключу) / `sql` (реляционные таблицы, совместимо с бэкендом Go)
->   - `DB_DRIVER`: драйвер базы данных: `auto` (по умолчанию, автоопределение) / `blob` / `cfkv` / `kv` / `d1` / `mysql`
->   - Остальные необязательные переменные см. в **подробном руководстве по развёртыванию**: [Cloudflare](https://doc.oplist.org/guide/installation/worker#deploy-to-cloudflare-workers) · [EdgeOne](https://doc.oplist.org/guide/installation/worker#deploy-to-edgeone) · [ESA](https://doc.oplist.org/guide/installation/worker#deploy-to-alibaba-cloud-esa)
+> - При развёртывании укажите `JWT_SECRET` (случайная строка от 16 символов, например `openssl rand -hex 32`): она подписывает JWT и шифрует данные; если не задана, будет сгенерирована и сохранена при инициализации
+> - Хранилище данных автоматически использует встроенный постоянный бэкенд платформы (`DB_DRIVER=auto`) — настройка не требуется; остальные переменные см. в [Переменные окружения](https://doc.oplist.org/ecosystem/official_worker/guide_env)
+> - При первом посещении после развёртывания открывается **мастер установки**: задайте учётную запись и пароль администратора в браузере, чтобы завершить инициализацию (установите `ADMIN_PASS`, чтобы пропустить мастер)
 
 
 ## Возможности
@@ -61,7 +60,7 @@ OpenList-Worker — это официальный порт проекта [OpenL
 
 - **Отечественные облачные диски**: Aliyundrive (Open/Share), Quark (Open/UC TV), Baidu Netdisk (Альбом), 115 (Open/Share), 123 Pan (Open/Share), Tianyi Cloud (189/PC/TV), China Mobile Cloud (139/Hecaiyun), Wopan, Thunder, Tencent Weiyun, Lanzou, PikPak (Share), Doubao, Guangyapan, Chaoxing Group, Lenovo NAS Share, Teambition, WPS Cloud, Alibaba Docs, HalalCloud, MediaTrack и др.
 - **Международные облачные диски**: Google Drive (Альбом), OneDrive (App/ShareLink), Dropbox, MEGA, MediaFire, Proton Drive, Yandex Disk, Degoo, Bunny Storage, TeraBox и др.
-- **Объектные хранилища**: S3-совместимые (AWS/OSS/COS/MinIO и др.), UpYun USS, Azure Blob, WebDAV, FTP, SFTP, SMB, IPFS и др.
+- **Объектные хранилища**: S3-совместимые (AWS/OSS/COS/MinIO и др.), Cloudflare R2 (привязка Workers или S3 API), UpYun USS, Azure Blob, WebDAV, FTP, SFTP, SMB, IPFS и др.
 - **Хостинг кода**: GitHub, GitHub Releases, CNB Releases
 - **Программы облачных дисков**: OpenList (Share), AList V3, Cloudreve V3/V4, Kodbox, Seafile, Teldrive, Febbox и др.
 - **Прочие драйверы**: Netease Music, Misskey, Emby, Cloudflare Image Hosting и др.

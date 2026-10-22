@@ -11,6 +11,20 @@ import { search } from "../internal/op/search"
 import { checkAdminAuth } from "../pkg/utils"
 import { safeErrorMessage } from "../pkg/errs"
 import { validateHide } from "../pkg/meta"
+import {
+  PROXY_RANGE_DRIVERS,
+  driverMustProxy,
+  driverPreferProxy,
+  normalizeDriverName,
+} from "../internal/driver/proxy"
+import {
+  cacheKindPrefix,
+  cacheListKeys,
+  clearCache,
+  clearStorageCache,
+  getCacheRuntimeStatus,
+  type CacheKind,
+} from "../internal/cache"
 
 export const adminRouter = new Hono()
 
@@ -48,7 +62,14 @@ function generateSecureToken(length = 32): string {
 
 adminRouter.get("/storage/list", async (c) => {
   const db = await getDb(c.env)
-  const content = db.storages || []
+  // 排序对齐 Go internal/db.GetStorages（addStorageOrder = `order, id`）：
+  // 后台存储列表按「序号」升序、同序号按 id 升序，此前是按数组原始顺序返回。
+  const content = [...(db.storages || [])].sort((a: any, b: any) => {
+    const orderA = Number(a.order) || 0
+    const orderB = Number(b.order) || 0
+    if (orderA !== orderB) return orderA - orderB
+    return (Number(a.id) || 0) - (Number(b.id) || 0)
+  })
   return c.json({
     code: 200,
     message: "success",
@@ -108,6 +129,8 @@ adminRouter.get("/storage/get", async (c) => {
 
 export const normalizeDriver = (driverName: string): string => {
   const norm = (driverName || "").toLowerCase().replace(/[^a-z0-9]/g, "")
+  // 纯中文驱动名无法归一化为 a-z0-9，先做中文别名匹配
+  if ((driverName || "").includes("城通")) return "CtFile"
   if (!norm) return ""
   const available = Object.keys(driverConfigs)
   const matched = available.find(
@@ -117,6 +140,7 @@ export const normalizeDriver = (driverName: string): string => {
   )
   if (matched) return matched
   // Common OpenList aliases
+  if (norm.includes("ctfile") || norm === "400gb") return "CtFile"
   if (norm.startsWith("115")) return "115Open"
   if (norm.startsWith("123")) return "123Pan"
   if (norm.includes("aliyun")) return "AliyundriveOpen"
@@ -148,7 +172,6 @@ export const normalizeDriver = (driverName: string): string => {
       "minio",
       "ceph",
       "aws",
-      "r2",
       "b2",
       "cos",
       "oss",
@@ -156,7 +179,17 @@ export const normalizeDriver = (driverName: string): string => {
     ].includes(norm)
   )
     return "S3"
-  if (norm.startsWith("github")) return "Github"
+  // Cloudflare R2 是独立驱动（支持 Workers bucket binding 直连），不再归一到 S3；
+  // 历史配置里 driver=S3 且 endpoint 指向 R2 的记录仍走 S3 驱动，不受影响。
+  //
+  // 注意：上面的精确匹配已能命中 "Cloudflare R2"（norm 后会得到 cloudflarer2），
+  // 这里兜底的是它的各种简写/旧写法，避免落到 "S3" 或原样返回。
+  if (norm === "r2" || norm === "cfr2" || norm === "cloudflarer2")
+    return "Cloudflare R2"
+  // releases 别名必须在通用 github 别名之前，否则会被归一到 GitHub API
+  if (norm.startsWith("githubrelease")) return "GitHub Releases"
+  if (norm.startsWith("cnbrelease")) return "CNB Releases"
+  if (norm.startsWith("github")) return "GitHub API"
   if (norm === "local") return "Local"
   if (norm.includes("pikpak")) return "PikPak"
   if (norm.includes("seafile")) return "Seafile"
@@ -304,7 +337,10 @@ adminRouter.post("/storage/create", async (c) => {
       try {
         await saveDb(db, c.env)
       } catch (saveErr: any) {
-        console.error("[admin/storage/create] Failed to update storage status:", saveErr)
+        console.error(
+          "[admin/storage/create] Failed to update storage status:",
+          saveErr,
+        )
         // 状态更新失败不影响主流程，继续返回
       }
       return c.json({
@@ -317,7 +353,10 @@ adminRouter.post("/storage/create", async (c) => {
     try {
       await saveDb(db, c.env)
     } catch (saveErr: any) {
-      console.error("[admin/storage/create] Failed to update storage status after connection:", saveErr)
+      console.error(
+        "[admin/storage/create] Failed to update storage status after connection:",
+        saveErr,
+      )
       // 已经连接成功，状态更新失败不影响用户，继续返回成功
     }
   }
@@ -386,8 +425,12 @@ adminRouter.post("/storage/update", async (c) => {
     }
     if (!updatedStorage.disabled) {
       try {
-        const driver = await getDriver(updatedStorage.driver, updatedStorage)
-        await driver.init?.()
+        // getDriver creates and initializes a cache miss. Calling init again
+        // refreshes rotating credentials twice and persists the whole config
+        // twice before the final update below.
+        await getDriver(updatedStorage.driver, updatedStorage, {
+          deferTokenPersistence: true,
+        })
         updatedStorage.status = "work"
       } catch (e: any) {
         updatedStorage.status = e.message || String(e)
@@ -405,6 +448,9 @@ adminRouter.post("/storage/update", async (c) => {
     }
     db.storages[idx] = updatedStorage
     await saveDb(db, c.env)
+    // 存储配置已变更（挂载路径 / root_folder_path / addition / 缓存策略等），
+    // 既有缓存全部失效，避免继续返回旧挂载点或旧凭据下的结果。
+    await clearStorageCache(updatedStorage.id, c.env)
   }
   return c.json({ code: 200, message: "success", data: null })
 })
@@ -414,6 +460,9 @@ adminRouter.post("/storage/delete", async (c) => {
   const db = await getDb(c.env)
   db.storages = db.storages.filter((s: any) => s.id !== id)
   await saveDb(db, c.env)
+  // 存储已删除：其文件树 / 下载链接缓存必须一并清理，否则 id 复用时
+  // 新存储会读到旧存储的缓存内容。
+  await clearStorageCache(id, c.env)
   return c.json({ code: 200, message: "success", data: null })
 })
 
@@ -425,13 +474,13 @@ adminRouter.post("/storage/enable", async (c) => {
     s.disabled = false
     s.modified = new Date().toISOString()
     await saveDb(db, c.env)
+    await clearStorageCache(id, c.env)
     // 异步初始化驱动（不阻塞响应）：启用多个云盘时立即返回，
     // 初始化完成后更新状态；失败时把错误写入 status，下次访问或
     // 重新加载时会再次尝试。
     ;(async () => {
       try {
-        const driver = await getDriver(s.driver, s)
-        await driver.init?.()
+        await getDriver(s.driver, s)
         const db2 = await getDb(c.env)
         const st = db2.storages.find((x: any) => x.id === id)
         if (st && !st.disabled) {
@@ -459,6 +508,7 @@ adminRouter.post("/storage/disable", async (c) => {
   if (s) {
     s.disabled = true
     await saveDb(db, c.env)
+    await clearStorageCache(id, c.env)
   }
   return c.json({ code: 200, message: "success", data: null })
 })
@@ -473,6 +523,7 @@ adminRouter.get("/driver/names", (c) => {
       "Onedrive",
       "OnedriveAPP",
       "Quark",
+      "QuarkUcTv",
       "123Pan",
       "BaiduNetdisk",
       "115Open",
@@ -515,11 +566,13 @@ adminRouter.get("/driver/names", (c) => {
       "GuangYaPan",
       "AutoIndex",
       "ProtonDrive",
+      "GitHub Releases",
+      "CNB Releases",
     ],
   })
 })
 
-const COMMON_FIELDS = [
+const BASE_FIELDS = [
   {
     name: "mount_path",
     type: "string",
@@ -543,34 +596,148 @@ const COMMON_FIELDS = [
     type: "number",
     default: "30",
     required: false,
+    help: "目录内容缓存时长（分钟）",
   },
-  {
-    name: "web_proxy",
+]
+
+/**
+ * 路径级缓存覆盖（对齐 Go model.Storage.CustomCachePolicies）。
+ * 支持 JSON 数组：[{"path":"/photos/*","cache_expiration":1440}]
+ * 或映射形式：{"/photos/*": 1440}
+ */
+const CUSTOM_CACHE_POLICIES_FIELD = {
+  name: "custom_cache_policies",
+  type: "text",
+  default: "",
+  required: false,
+  help: '按路径覆盖缓存时长，JSON 格式，如 [{"path":"/photos/*","cache_expiration":1440}]',
+}
+
+/** 存储级签名开关（对齐 Go common.IsStorageSignEnabled） */
+const ENABLE_SIGN_FIELD = {
+  name: "enable_sign",
+  type: "bool",
+  default: "false",
+  required: true,
+  help: "Enable signature validation for this storage",
+}
+
+/** 禁止目录列表（对齐 Go model.Storage.DisableIndex） */
+const DISABLE_INDEX_FIELD = {
+  name: "disable_index",
+  type: "bool",
+  default: "false",
+  required: false,
+  help: "Disable directory listing for this storage",
+}
+
+/**
+ * proxy_range（对齐 Go op/driver.go）：仅对声明了 ProxyRangeOption 的驱动开放。
+ *
+ * 默认 true：透传客户端 Range 是默认行为（Go 的透明代理本就转发客户端请求头，
+ * 见 internal/net/serve.go 的 ProcessHeader），该字段只在需要显式关闭时使用。
+ */
+function buildProxyRangeField() {
+  return {
+    name: "proxy_range",
     type: "bool",
-    default: "false",
+    default: "true",
     required: false,
-  },
-  {
-    name: "webdav_policy",
-    type: "select",
-    options: "302_redirect,use_proxy_url,native_proxy",
-    default: "302_redirect",
-    required: false,
-  },
-  {
-    name: "down_proxy_url",
-    type: "string",
-    default: "",
-    required: false,
-  },
-  {
-    name: "seed_policy",
-    type: "select",
-    options: "inherit,on,off",
-    default: "inherit",
-    required: true,
-    help: "Override automatic transfer-seed generation for this storage",
-  },
+    help: "Need to enable proxy",
+  }
+}
+
+const WEB_PROXY_FIELD = {
+  name: "web_proxy",
+  type: "bool",
+  default: "false",
+  required: false,
+}
+
+const WEBDAV_POLICY_FIELD = {
+  name: "webdav_policy",
+  type: "select",
+  options: "302_redirect,use_proxy_url,native_proxy",
+  default: "302_redirect",
+  required: false,
+}
+
+/**
+ * 按 Go internal/op/driver.go 的规则构造代理相关表单项。
+ *
+ * 驱动能力（MustProxy / PreferProxy / ProxyRangeOption）**全部**由
+ * internal/driver/proxy.ts 派生——那里是驱动能力表的唯一真相（对齐
+ * Go drivers 各驱动的 meta.go）。admin.ts 不再维护第二份 only_proxy/prefer 清单，
+ * 避免两处各自演化后与运行时决策不一致。
+ *
+ *   - MustProxy()   ：无 web_proxy / down_proxy_url，策略仅 use_proxy_url | native_proxy
+ *   - DefaultProxy()：web_proxy 默认 true、策略默认 native_proxy（PreferProxy 驱动）
+ *   - 其余          ：web_proxy 默认 false、策略默认 302_redirect
+ */
+function buildProxyFields(driverKey = "") {
+  const normKey = normalizeDriverName(driverKey)
+  const rangeFields = PROXY_RANGE_DRIVERS.has(normKey)
+    ? [buildProxyRangeField()]
+    : []
+
+  if (driverMustProxy(normKey)) {
+    return [
+      ...rangeFields,
+      {
+        ...WEBDAV_POLICY_FIELD,
+        options: "use_proxy_url,native_proxy",
+        default: "native_proxy",
+      },
+    ]
+  }
+
+  const preferProxy = driverPreferProxy(normKey)
+  return [
+    ...rangeFields,
+    preferProxy
+      ? { ...WEB_PROXY_FIELD, default: "true" }
+      : { ...WEB_PROXY_FIELD },
+    preferProxy
+      ? { ...WEBDAV_POLICY_FIELD, default: "native_proxy" }
+      : { ...WEBDAV_POLICY_FIELD },
+  ]
+}
+
+const SEED_POLICY_FIELD = {
+  name: "seed_policy",
+  type: "select",
+  options: "inherit,on,off",
+  default: "inherit",
+  required: true,
+  help: "Override automatic transfer-seed generation for this storage",
+}
+
+/** 对齐 Go：down_proxy_url 对所有非 MustProxy 驱动开放；MustProxy 驱动不需要 */
+const DOWN_PROXY_URL_FIELD = {
+  name: "down_proxy_url",
+  type: "string",
+  default: "",
+  required: false,
+  help: "自定义下载代理地址（支持 $path 占位符；留空则用本服务代理）",
+}
+
+const DISABLE_PROXY_SIGN_FIELD = {
+  name: "disable_proxy_sign",
+  type: "bool",
+  default: "false",
+  required: false,
+  help: "Disable sign for Download proxy URL",
+}
+
+const COMMON_FIELDS = [
+  ...BASE_FIELDS,
+  CUSTOM_CACHE_POLICIES_FIELD,
+  ENABLE_SIGN_FIELD,
+  DISABLE_INDEX_FIELD,
+  ...buildProxyFields(),
+  DOWN_PROXY_URL_FIELD,
+  DISABLE_PROXY_SIGN_FIELD,
+  SEED_POLICY_FIELD,
 ]
 
 const driverConfigs: Record<string, any> = {
@@ -652,7 +819,17 @@ const driverConfigs: Record<string, any> = {
   Onedrive: {
     name: "Onedrive",
     default_mount_path: "/onedrive",
-    common: COMMON_FIELDS.slice(0, 3),
+    // 对齐 Go drivers/onedrive/meta.go：无 MustProxy/PreferProxy，
+    // webdav_policy 默认 302_redirect（OneDrive 默认走直链）。
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("Onedrive"),
+      DOWN_PROXY_URL_FIELD,
+      DISABLE_PROXY_SIGN_FIELD,
+    ],
     additional: [
       {
         name: "root_folder_path",
@@ -746,7 +923,16 @@ const driverConfigs: Record<string, any> = {
   OnedriveAPP: {
     name: "OnedriveAPP",
     default_mount_path: "/onedrive_app",
-    common: COMMON_FIELDS.slice(0, 3),
+    // 同 Onedrive：默认 302_redirect
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("OnedriveAPP"),
+      DOWN_PROXY_URL_FIELD,
+      DISABLE_PROXY_SIGN_FIELD,
+    ],
     additional: [
       {
         name: "root_folder_path",
@@ -816,7 +1002,15 @@ const driverConfigs: Record<string, any> = {
   GoogleDrive: {
     name: "GoogleDrive",
     default_mount_path: "/google-drive",
-    common: COMMON_FIELDS,
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("GoogleDrive"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "refresh_token",
@@ -866,7 +1060,7 @@ const driverConfigs: Record<string, any> = {
       name: "GoogleDrive",
       local_sort: true,
       only_local: false,
-      only_proxy: false,
+      only_proxy: true,
       no_cache: false,
       no_upload: false,
       need_ms: false,
@@ -936,10 +1130,81 @@ const driverConfigs: Record<string, any> = {
       default_root: "0",
     },
   },
+  QuarkUcTv: {
+    name: "QuarkUcTv",
+    default_mount_path: "/quarktv",
+    common: COMMON_FIELDS,
+    additional: [
+      {
+        name: "variant",
+        type: "select",
+        options: "Quark,UC",
+        default: "Quark",
+        required: true,
+        help: "夸克 TV 端选 Quark，UC TV 端选 UC（服务端固定协议参数）",
+      },
+      {
+        name: "refresh_token",
+        type: "text",
+        default: "",
+        required: true,
+        help: "通过 extscreen 授权流程获取（http://api.extscreen.com/quarkdrive，UC 用 /ucdrive），必填",
+      },
+      {
+        name: "device_id",
+        type: "string",
+        default: "",
+        required: false,
+        help: "自定义设备标识，留空自动生成",
+      },
+      {
+        name: "order_by",
+        type: "select",
+        options: "file_name,updated_at",
+        default: "file_name",
+        required: false,
+      },
+      {
+        name: "order_direction",
+        type: "select",
+        options: "asc,desc",
+        default: "asc",
+        required: false,
+      },
+      {
+        name: "link_method",
+        type: "select",
+        options: "download,streaming",
+        default: "download",
+        required: false,
+        help: "播放/下载链接的获取方式；视频可选 streaming 转码档",
+      },
+    ],
+    config: {
+      name: "QuarkUcTv",
+      local_sort: true,
+      only_local: false,
+      only_proxy: false,
+      no_cache: false,
+      // 只读驱动：仅实现 list/get，不支持上传
+      no_upload: true,
+      need_ms: false,
+      default_root: "0",
+    },
+  },
   "123Pan": {
     name: "123Pan",
     default_mount_path: "/123",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/123/meta.go：只有 PreferProxy（无 OnlyProxy）
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("123Pan"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "username",
@@ -1006,7 +1271,7 @@ const driverConfigs: Record<string, any> = {
       name: "123Pan",
       local_sort: true,
       only_local: false,
-      only_proxy: true,
+      only_proxy: false,
       no_cache: false,
       no_upload: false,
       need_ms: false,
@@ -1016,7 +1281,16 @@ const driverConfigs: Record<string, any> = {
   BaiduNetdisk: {
     name: "BaiduNetdisk",
     default_mount_path: "/baidu",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/baidu_netdisk/meta.go：只有 PreferProxy（无 OnlyProxy）
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("BaiduNetdisk"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "refresh_token",
@@ -1135,7 +1409,7 @@ const driverConfigs: Record<string, any> = {
       name: "BaiduNetdisk",
       local_sort: true,
       only_local: false,
-      only_proxy: true,
+      only_proxy: false,
       no_cache: false,
       no_upload: false,
       need_ms: false,
@@ -1145,7 +1419,16 @@ const driverConfigs: Record<string, any> = {
   "115Open": {
     name: "115Open",
     default_mount_path: "/115",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/115_open/meta.go：OnlyProxy（无 302 选项）
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("115Open"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "access_token",
@@ -1201,7 +1484,7 @@ const driverConfigs: Record<string, any> = {
       name: "115Open",
       local_sort: true,
       only_local: false,
-      only_proxy: true,
+      only_proxy: false,
       no_cache: false,
       no_upload: false,
       need_ms: false,
@@ -1305,6 +1588,141 @@ const driverConfigs: Record<string, any> = {
       no_upload: false,
       need_ms: false,
       default_root: "/",
+    },
+  },
+  // Issue #107：驱动已实现（internal/op/storage.ts）但此处漏配，前端存储列表
+  // 因此看不到「GitHub Releases」；字段对齐 Go meta 与前端 i18n。
+  "GitHub Releases": {
+    name: "GitHub Releases",
+    default_mount_path: "/github_releases",
+    common: COMMON_FIELDS,
+    additional: [
+      {
+        name: "root_folder_path",
+        type: "string",
+        default: "/",
+        required: false,
+      },
+      {
+        name: "repo_structure",
+        type: "text",
+        default: "OpenListTeam/OpenList",
+        required: true,
+        help: "structure:[path:]org/repo",
+      },
+      {
+        name: "show_readme",
+        type: "bool",
+        default: "true",
+        required: false,
+        help: "show README、LICENSE file",
+      },
+      {
+        name: "token",
+        type: "string",
+        default: "",
+        required: false,
+        help: "GitHub token, if you want to access private repositories or increase the rate limit",
+      },
+      {
+        name: "show_source_code",
+        type: "bool",
+        default: "false",
+        required: false,
+        help: "show Source code (zip/tar.gz)",
+      },
+      {
+        name: "show_all_version",
+        type: "bool",
+        default: "false",
+        required: false,
+        help: "show all versions",
+      },
+      {
+        name: "per_page",
+        type: "number",
+        default: "30",
+        required: false,
+        help: "releases per page (max 100), only works when show all versions",
+      },
+      {
+        name: "max_page",
+        type: "number",
+        default: "0",
+        required: false,
+        help: "max pages to fetch (0 = unlimited), only works when show all versions",
+      },
+      {
+        name: "gh_proxy",
+        type: "string",
+        default: "",
+        required: false,
+        help: "GitHub proxy, e.g. https://ghproxy.net/https://github.com",
+      },
+    ],
+    config: {
+      name: "GitHub Releases",
+      // 对齐 Go：只读发布源（NoUpload）
+      local_sort: false,
+      only_local: false,
+      only_proxy: false,
+      no_cache: false,
+      no_upload: true,
+      need_ms: false,
+      default_root: "",
+    },
+  },
+  // 同一处遗漏：CNB Releases 驱动同样未登记。
+  "CNB Releases": {
+    name: "CNB Releases",
+    default_mount_path: "/cnb_releases",
+    common: COMMON_FIELDS,
+    additional: [
+      {
+        name: "root_folder_id",
+        type: "string",
+        default: "",
+        required: false,
+      },
+      {
+        name: "repo",
+        type: "string",
+        default: "",
+        required: true,
+        help: "CNB 仓库，形如 org/repo",
+      },
+      {
+        name: "token",
+        type: "string",
+        default: "",
+        required: true,
+        help: "CNB 访问令牌",
+      },
+      {
+        name: "use_tag_name",
+        type: "bool",
+        default: "false",
+        required: false,
+        help: "Use tag name instead of release name",
+      },
+      {
+        name: "default_branch",
+        type: "string",
+        default: "main",
+        required: false,
+        help: "Default branch for new releases",
+      },
+    ],
+    config: {
+      name: "CNB Releases",
+      local_sort: true,
+      only_local: false,
+      only_proxy: false,
+      no_cache: false,
+      // Go 版支持上传；TS 无状态实现 put 直接报错，隐藏上传入口
+      no_upload: true,
+      need_ms: false,
+      default_root: "",
     },
   },
   Thunder: {
@@ -1504,7 +1922,16 @@ const driverConfigs: Record<string, any> = {
   "189Cloud": {
     name: "189Cloud",
     default_mount_path: "/189",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/189/meta.go：OnlyProxy
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("189Cloud"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "username",
@@ -1662,10 +2089,82 @@ const driverConfigs: Record<string, any> = {
       default_root: "-1",
     },
   },
+  CtFile: {
+    name: "CtFile",
+    default_mount_path: "/ctfile",
+    common: COMMON_FIELDS,
+    additional: [
+      {
+        name: "session",
+        type: "text",
+        default: "",
+        required: true,
+        help: "开放接口 Session：登录城通网盘管理后台 →「开放接口登录密钥管理」生成；也可参考 openapi.ctfile.com 通过登录接口获取",
+      },
+      {
+        name: "cloud_type",
+        type: "select",
+        options: "public,private",
+        default: "public",
+        required: false,
+        help: "挂载的云类型：public=公有云（默认）、private=私有云",
+      },
+      {
+        name: "base_url",
+        type: "string",
+        default: "https://rest.ctfile.com/v1",
+        required: false,
+        help: "OpenAPI 基础地址",
+      },
+      {
+        name: "order_by",
+        type: "select",
+        options: "name,size,time",
+        default: "name",
+        required: false,
+      },
+      {
+        name: "order_direction",
+        type: "select",
+        options: "asc,desc",
+        default: "asc",
+        required: false,
+      },
+      {
+        name: "user_agent",
+        type: "string",
+        default:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+        required: true,
+        help: "请求城通网盘 API 与下载直链时携带的 User-Agent",
+      },
+    ],
+    config: {
+      name: "CtFile",
+      local_sort: true,
+      only_local: false,
+      only_proxy: false,
+      no_cache: false,
+      no_upload: false,
+      need_ms: false,
+      default_root: "",
+    },
+  },
   WebDav: {
     name: "WebDav",
     default_mount_path: "/webdav",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/webdav/meta.go 的 PreferProxy: true：
+    // web_proxy 默认 true、webdav_policy 默认 native_proxy。
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("WebDav"),
+      DOWN_PROXY_URL_FIELD,
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "vendor",
@@ -1723,7 +2222,7 @@ const driverConfigs: Record<string, any> = {
       name: "WebDav",
       local_sort: true,
       only_local: false,
-      only_proxy: true,
+      only_proxy: false,
       no_cache: false,
       no_upload: false,
       need_ms: false,
@@ -1792,6 +2291,132 @@ const driverConfigs: Record<string, any> = {
       need_ms: false,
       default_root: "0",
       no_overwrite_upload: true,
+    },
+  },
+  "Cloudflare R2": {
+    name: "Cloudflare R2",
+    default_mount_path: "/r2",
+    common: COMMON_FIELDS,
+    additional: [
+      {
+        name: "bucket_binding",
+        type: "string",
+        default: "",
+        required: false,
+        help: "wrangler.jsonc 中 r2_buckets 的 binding 名（如 R2）。填写后优先走 Workers 原生绑定直连，无需 API Token。",
+      },
+      {
+        name: "mode",
+        type: "select",
+        options: "auto,binding",
+        default: "auto",
+        required: false,
+        help: "auto=有绑定用绑定、否则走 S3 兼容 API；binding=只用绑定（缺绑定直接报错，不静默回退）。",
+      },
+      {
+        name: "account_id",
+        type: "string",
+        default: "",
+        required: false,
+        help: "Cloudflare 账号 ID，用于自动推导 endpoint（https://<account>.r2.cloudflarestorage.com）。",
+      },
+      {
+        name: "bucket",
+        type: "string",
+        default: "",
+        required: false,
+        help: "桶名。binding 模式仅用于展示与自定义域名去前缀；api 模式必填。",
+      },
+      {
+        name: "endpoint",
+        type: "string",
+        default: "",
+        required: false,
+        help: "留空则由 account_id 推导；也可填自定义 S3 兼容网关地址。",
+      },
+      {
+        name: "region",
+        type: "string",
+        default: "auto",
+        required: false,
+      },
+      {
+        name: "access_key_id",
+        type: "string",
+        default: "",
+        required: false,
+        help: "api 模式必填（R2 → Manage R2 API Tokens）",
+      },
+      {
+        name: "secret_access_key",
+        type: "string",
+        default: "",
+        required: false,
+      },
+      {
+        name: "session_token",
+        type: "string",
+        default: "",
+        required: false,
+      },
+      {
+        name: "root_folder_path",
+        type: "string",
+        default: "/",
+        required: false,
+      },
+      {
+        name: "custom_host",
+        type: "string",
+        default: "",
+        required: false,
+        help: "R2 公开域名（r2.dev）或自定义域名；填写后直链走该域名（需桶已开启公开访问）。",
+      },
+      {
+        name: "sign_url_expire",
+        type: "number",
+        default: "4",
+        required: false,
+        help: "api 模式预签名直链有效期（小时，R2 上限 7 天）",
+      },
+      {
+        name: "placeholder",
+        type: "string",
+        default: "",
+        required: false,
+      },
+      {
+        name: "remove_bucket",
+        type: "bool",
+        default: "false",
+        required: false,
+        help: "true",
+      },
+      {
+        name: "order_by",
+        type: "select",
+        options: "name,size,modified",
+        default: "name",
+        required: false,
+      },
+      {
+        name: "order_direction",
+        type: "select",
+        options: "asc,desc",
+        default: "asc",
+        required: false,
+      },
+    ],
+    config: {
+      name: "Cloudflare R2",
+      local_sort: true,
+      only_local: false,
+      only_proxy: false,
+      no_cache: false,
+      no_upload: false,
+      need_ms: false,
+      default_root: "/",
+      check_status: true,
     },
   },
   S3: {
@@ -2085,7 +2710,16 @@ const driverConfigs: Record<string, any> = {
   WeiYun: {
     name: "WeiYun",
     default_mount_path: "/weiyun",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/weiyun/meta.go：OnlyProxy
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("WeiYun"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "root_folder_id",
@@ -2136,7 +2770,16 @@ const driverConfigs: Record<string, any> = {
   SFTP: {
     name: "SFTP",
     default_mount_path: "/sftp",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/sftp/meta.go：OnlyProxy + NoLinkURL（无直链可 302）
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("SFTP"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "address",
@@ -2199,7 +2842,16 @@ const driverConfigs: Record<string, any> = {
   FTP: {
     name: "FTP",
     default_mount_path: "/ftp",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/ftp/meta.go：OnlyProxy + NoLinkURL
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("FTP"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "address",
@@ -2477,7 +3129,16 @@ const driverConfigs: Record<string, any> = {
   Terabox: {
     name: "Terabox",
     default_mount_path: "/terabox",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/terabox/meta.go：OnlyProxy
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("Terabox"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "cookie",
@@ -2517,7 +3178,7 @@ const driverConfigs: Record<string, any> = {
       name: "Terabox",
       local_sort: true,
       only_local: false,
-      only_proxy: true,
+      only_proxy: false,
       no_cache: false,
       no_upload: false,
       need_ms: false,
@@ -2575,7 +3236,17 @@ const driverConfigs: Record<string, any> = {
   Alias: {
     name: "Alias",
     default_mount_path: "/alias",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/alias/meta.go：ProxyRangeOption
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("Alias"),
+      DOWN_PROXY_URL_FIELD,
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "paths",
@@ -2765,7 +3436,17 @@ const driverConfigs: Record<string, any> = {
   "139Yun": {
     name: "139Yun",
     default_mount_path: "/139",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/139/meta.go：ProxyRangeOption 且实例默认 ProxyRange = true
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("139Yun"),
+      DOWN_PROXY_URL_FIELD,
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "authorization",
@@ -2827,7 +3508,16 @@ const driverConfigs: Record<string, any> = {
   Mega_nz: {
     name: "Mega_nz",
     default_mount_path: "/mega",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/mega/meta.go：OnlyProxy + NoLinkURL
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("Mega_nz"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "email",
@@ -2949,7 +3639,16 @@ const driverConfigs: Record<string, any> = {
   "123PanShare": {
     name: "123PanShare",
     default_mount_path: "/123_share",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/123_share/meta.go：OnlyProxy + PreferProxy
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("123PanShare"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "sharekey",
@@ -2994,7 +3693,7 @@ const driverConfigs: Record<string, any> = {
       name: "123PanShare",
       local_sort: true,
       only_local: false,
-      only_proxy: true,
+      only_proxy: false,
       no_cache: false,
       no_upload: true,
       need_ms: false,
@@ -3152,7 +3851,16 @@ const driverConfigs: Record<string, any> = {
   SMB: {
     name: "SMB",
     default_mount_path: "/smb",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/smb/meta.go：OnlyProxy + NoLinkURL
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("SMB"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "address",
@@ -3219,7 +3927,16 @@ const driverConfigs: Record<string, any> = {
   Crypt: {
     name: "Crypt",
     default_mount_path: "/crypt",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/crypt/meta.go：OnlyProxy + NoLinkURL
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("Crypt"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "remote_path",
@@ -3290,7 +4007,16 @@ const driverConfigs: Record<string, any> = {
   Virtual: {
     name: "Virtual",
     default_mount_path: "/virtual",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/virtual/meta.go：OnlyProxy + NoLinkURL
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("Virtual"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "num_file",
@@ -3336,7 +4062,17 @@ const driverConfigs: Record<string, any> = {
   AListV3: {
     name: "AListV3",
     default_mount_path: "/alist",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/alist_v3/meta.go：ProxyRangeOption
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("AListV3"),
+      DOWN_PROXY_URL_FIELD,
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "url",
@@ -3427,7 +4163,16 @@ const driverConfigs: Record<string, any> = {
   Strm: {
     name: "Strm",
     default_mount_path: "/strm",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/strm/meta.go：OnlyProxy + NoLinkURL
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("Strm"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "paths",
@@ -3775,9 +4520,36 @@ const driverConfigs: Record<string, any> = {
         type: "string",
         default: "",
         required: false,
-        help: "手机号（登录用，+86 格式）",
+        help: "手机号（短信登录用，+86 格式）。两段式登录：先填手机号并设 send_code=true 保存以发送验证码，再填入 verify_code 保存完成登录",
       },
-      { name: "verify_code", type: "string", default: "", required: false },
+      {
+        name: "captcha_token",
+        type: "string",
+        default: "",
+        required: false,
+        help: "图形验证 token（发短信需要时提供；置空时驱动会自动获取）",
+      },
+      {
+        name: "send_code",
+        type: "bool",
+        default: "",
+        required: false,
+        help: "设为 true 并保存以发送短信验证码，发送后自动复位为 false",
+      },
+      {
+        name: "verify_code",
+        type: "string",
+        default: "",
+        required: false,
+        help: "短信验证码，与 phone_number 配合使用，保存后完成登录",
+      },
+      {
+        name: "verification_id",
+        type: "string",
+        default: "",
+        required: false,
+        help: "发送短信后自动生成，请勿手动修改",
+      },
       { name: "page_size", type: "number", default: "100", required: false },
       { name: "order_by", type: "number", default: "3", required: false },
       { name: "sort_type", type: "number", default: "1", required: false },
@@ -3857,7 +4629,16 @@ const driverConfigs: Record<string, any> = {
   ProtonDrive: {
     name: "ProtonDrive",
     default_mount_path: "/proton",
-    common: COMMON_FIELDS,
+    // 对齐 Go drivers/proton_drive/meta.go：OnlyProxy + NoLinkURL
+    common: [
+      ...BASE_FIELDS,
+      CUSTOM_CACHE_POLICIES_FIELD,
+      ENABLE_SIGN_FIELD,
+      DISABLE_INDEX_FIELD,
+      ...buildProxyFields("ProtonDrive"),
+      DISABLE_PROXY_SIGN_FIELD,
+      SEED_POLICY_FIELD,
+    ],
     additional: [
       {
         name: "email",
@@ -3924,7 +4705,11 @@ adminRouter.get("/driver/list", (c) => {
 
 adminRouter.get("/driver/info", (c) => {
   const driverName = c.req.query("driver") || ""
-  const info = driverConfigs[driverName] || driverConfigs["AliyundriveOpen"]
+  // 兼容 Go 导入名（如 GithubReleases）：精确未命中时按别名归一化再回退
+  const info =
+    driverConfigs[driverName] ||
+    driverConfigs[normalizeDriver(driverName)] ||
+    driverConfigs["AliyundriveOpen"]
   return c.json({
     code: 200,
     message: "success",
@@ -4120,8 +4905,21 @@ adminRouter.post("/setting/set_thunderx", async (c) => {
 adminRouter.post("/setting/reset_token", async (c) => {
   const newToken = generateSecureToken(32)
   await updateSettingValue(c.env, { token: newToken })
-  // 对应 Go sign.Instance()：token 变更后清除进程内 JWT secret 缓存，
-  // 强制下次请求重新加载新密钥，使所有旧 token 立即失效。
+  // 本接口轮换的是 `token` 设置，即**静态 API Token**
+  // （pkg/utils.isStaticApiToken 用它比对 `Authorization: Bearer <token>`）。
+  //
+  // 关于下载链接（重要，勿再写成「旧链接立即失效」）：
+  //   下载签名由 pkg/sign 用 getJwtSecret() 计算，密钥来源是
+  //   env.JWT_SECRET 或持久化的 openlist_jwt_secret，**与 `token` 设置无关**。
+  //   因此轮换本设置**不会**让已签发的下载链接失效。
+  //   历史注释声称「与 Go ResetToken 行为一致、旧链接立即失效」，与实现不符，
+  //   会让人误以为已经撤销了旧链接。
+  //
+  // 若确实要让旧下载链接失效：需要轮换 JWT_SECRET（注意这同时会使所有已登录
+  // 会话失效）；把它做成独立开关属于后续工作，不能靠本接口悄悄生效。
+  //
+  // 这里的 resetJwtSecretCache() 只是让进程内缓存与最新 env/持久化值对齐，
+  // 并不会更换密钥，因此不会使已签发的 JWT 失效。
   const { resetJwtSecretCache } = await import("./middlewares")
   resetJwtSecretCache()
   return c.json({ code: 200, message: "success", data: newToken })
@@ -4171,7 +4969,11 @@ adminRouter.post("/meta/create", async (c) => {
     const invalidLine = validateHide(hide)
     if (invalidLine) {
       return c.json(
-        { code: 400, message: `invalid hide regex: ${invalidLine}`, data: null },
+        {
+          code: 400,
+          message: `invalid hide regex: ${invalidLine}`,
+          data: null,
+        },
         400,
       )
     }
@@ -4224,7 +5026,11 @@ adminRouter.post("/meta/update", async (c) => {
     const invalidLine = validateHide(hide)
     if (invalidLine) {
       return c.json(
-        { code: 400, message: `invalid hide regex: ${invalidLine}`, data: null },
+        {
+          code: 400,
+          message: `invalid hide regex: ${invalidLine}`,
+          data: null,
+        },
         400,
       )
     }
@@ -4289,6 +5095,117 @@ adminRouter.get("/kv/status", async (c) => {
     code: 200,
     message: "success",
     data: { ...statusData, store: storeStatus },
+  })
+})
+
+// --- 缓存管理（文件树缓存 / 下载链接缓存）---
+//
+// 默认只向数据库启用（CACHE_DRIVER=db）；想要改用 / 额外启用 KV、Blob 等
+// 专用后端，需显式配置 CACHE_DRIVER（如 `kv`、`db,kv`、`blob`）。
+// 这里的接口只做「查看状态 / 清空」，不改变后端选择（后端只认环境变量）。
+
+/** 缓存状态：生效配置 + 实际后端 + 当前条目数。 */
+adminRouter.get("/cache/status", async (c) => {
+  const runtime = await getCacheRuntimeStatus(c.env)
+  let fileTree = 0
+  let downloadLink = 0
+  try {
+    const [ftKeys, lnKeys] = await Promise.all([
+      cacheListKeys(cacheKindPrefix("ft", runtime.config.prefix), c.env),
+      cacheListKeys(cacheKindPrefix("ln", runtime.config.prefix), c.env),
+    ])
+    fileTree = ftKeys.length
+    downloadLink = lnKeys.length
+  } catch (err: any) {
+    return c.json({
+      code: 200,
+      message: "success",
+      data: {
+        ...runtime,
+        entries: null,
+        entries_error: safeErrorMessage(err),
+      },
+    })
+  }
+  return c.json({
+    code: 200,
+    message: "success",
+    data: {
+      ...runtime,
+      entries: {
+        file_tree: fileTree,
+        download_link: downloadLink,
+        total: fileTree + downloadLink,
+      },
+    },
+  })
+})
+
+/**
+ * 清空缓存。
+ * body: { type?: "file_tree" | "download_link" | "all", storage_id?: number }
+ * 省略 type 表示两级缓存全清；省略 storage_id 表示所有存储。
+ */
+adminRouter.post("/cache/clear", async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const rawType = String(body.type ?? c.req.query("type") ?? "")
+    .trim()
+    .toLowerCase()
+  const kind: CacheKind | undefined =
+    rawType === "file_tree" || rawType === "ft" || rawType === "tree"
+      ? "ft"
+      : rawType === "download_link" || rawType === "link" || rawType === "ln"
+        ? "ln"
+        : undefined
+
+  const idRaw = body.storage_id ?? c.req.query("storage_id")
+  const hasId = idRaw !== undefined && idRaw !== null && String(idRaw) !== ""
+
+  const removed = await clearCache(c.env, {
+    ...(kind ? { kind } : {}),
+    ...(hasId ? { storageId: idRaw } : {}),
+  })
+  return c.json({
+    code: 200,
+    message: "success",
+    data: { removed, type: kind ?? "all", storage_id: hasId ? idRaw : null },
+  })
+})
+
+/**
+ * 刷新文件树缓存（对齐参考实现 OpenList.ts 的 POST /api/admin/storage/refresh）。
+ * body/query 可选 `id`：只刷新该存储。
+ */
+adminRouter.post("/storage/refresh", async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const idRaw = body.id ?? c.req.query("id")
+  const hasId = idRaw !== undefined && idRaw !== null && String(idRaw) !== ""
+  const removed = await clearCache(c.env, {
+    kind: "ft",
+    ...(hasId ? { storageId: idRaw } : {}),
+  })
+  return c.json({
+    code: 200,
+    message: "success",
+    data: { removed, storage_id: hasId ? idRaw : null },
+  })
+})
+
+/**
+ * 刷新单个存储的文件树缓存
+ * （对齐参考实现 OpenList.ts 的 POST /api/admin/storage/refresh_one?id=）。
+ */
+adminRouter.post("/storage/refresh_one", async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const idRaw = c.req.query("id") ?? body.id
+  if (idRaw === undefined || idRaw === null || String(idRaw) === "") {
+    return c.json({ code: 400, message: "id is required", data: null }, 400)
+  }
+  const removed = await clearCache(c.env, { kind: "ft", storageId: idRaw })
+  return c.json({
+    code: 200,
+    message: "success",
+    data: { removed, storage_id: idRaw },
   })
 })
 
@@ -4756,7 +5673,7 @@ adminRouter.post("/message/get", (c) => {
 adminRouter.get("/audit/logs", async (c) => {
   try {
     const { queryAuditLogs } = await import("../internal/model/audit")
-    
+
     const username = c.req.query("username")
     const action = c.req.query("action")
     const method = c.req.query("method")
@@ -4843,5 +5760,3 @@ adminRouter.post("/audit/cleanup", async (c) => {
     )
   }
 })
-
-

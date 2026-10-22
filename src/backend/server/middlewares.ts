@@ -1,21 +1,52 @@
 import { Context } from "hono"
 import { verify } from "hono/jwt"
 import { checkAdminAuth, isStaticApiToken } from "../pkg/utils"
-import { getDb } from "../internal/model/db"
+import { getDb, readPersistedSecret, ENCRYPTION_SECRET_KV_KEY } from "../internal/model/db"
+import { isPasswordStampValid } from "../pkg/password"
 
 // 不再硬编码 JWT 密钥。优先使用环境变量 JWT_SECRET（推荐在生产配置），
-// 否则从 KV 持久化一个随机密钥（首次生成后复用，重启不失效），
-// 开发环境（无 KV）回退到进程内随机密钥。
+// 否则从持久化后端读取一个随机密钥（首次生成后复用，重启不失效），
+// 开发环境（无持久化）回退到进程内随机密钥。
+//
+// 缓存粒度：**按 env 对象**，而不是单一的进程级变量。
+//
+// 为什么必须分 env：`env` 决定「去哪个后端读密钥」（driver 由 env 解析）。
+// 一个进程若先后服务两套不同配置（多环境/多项目共用实例、本地同时连两套配置、
+// 测试），单一进程级缓存会把先读到的那把密钥发给另一套环境，导致跨环境 token
+// 可以互相验证。Go 版不存在这个问题——它是单进程单部署，密钥在启动时由
+// `conf.Conf.JwtSecret` 一次性确定（server/router.go: common.SecretKey）；
+// TS 版必须按 env 隔离才能保持同样的语义。
 let cachedJwtSecret: string | null = null
+let jwtSecretByEnv = new WeakMap<object, string>()
 const JWT_SECRET_KV_KEY = "openlist_jwt_secret"
 
+/** 记录某个 env 的密钥，并更新进程级 last-known 值（无 env 对象时的兜底）。 */
+function rememberJwtSecret(env: any, secret: string): void {
+  if (env && typeof env === "object") jwtSecretByEnv.set(env, secret)
+  cachedJwtSecret = secret
+}
+
+/** 读取某个 env 的缓存密钥；没有 env 对象时退回进程级 last-known 值。 */
+function readCachedJwtSecret(env: any): string | null {
+  if (env && typeof env === "object") return jwtSecretByEnv.get(env) ?? null
+  return cachedJwtSecret
+}
+
 /**
- * 清除进程内 JWT secret 缓存。
- * 对应 Go 的 sign.Instance()：reset_token 后调用此函数，
- * 强制下次请求从 KV/env 重新加载新密钥，使旧 token 全部失效。
+ * 清除 JWT secret 缓存（全部 env），用于强制下次调用重新解析密钥来源。
+ *
+ * 语义边界（与 Go 对齐，勿夸大）：
+ *   - Go 的 `reset_token` 重置的是**链接签名密钥**，即 DB 里的 `token` 设置
+ *     （internal/sign/sign.go: NewHMACSign(setting.GetStr(conf.Token))），
+ *     并不更换 JWT 密钥（JWT 用 common.SecretKey = conf.Conf.JwtSecret）；
+ *   - TS 的 JWT 密钥来自 env.JWT_SECRET 或持久化的 openlist_jwt_secret，清缓存
+ *     后读到的是**同一把**密钥，因此已签发的 JWT **不会**失效——这与 Go 一致。
+ * 若确实要求所有已签发 JWT 立即失效，必须更换密钥本身，而不是只清缓存。
  */
 export function resetJwtSecretCache(): void {
   cachedJwtSecret = null
+  // WeakMap 无法逐项清空，整体替换即可（旧条目随 env 一起被 GC）。
+  jwtSecretByEnv = new WeakMap<object, string>()
 }
 
 function generateRandomSecret(): string {
@@ -26,24 +57,9 @@ function generateRandomSecret(): string {
 
 async function readKvSecret(env: any): Promise<string | null> {
   try {
-    const { getKvBinding } = await import("../internal/model/db")
-    const kvInfo = await getKvBinding(env)
-    if (kvInfo.mode === "none" || !kvInfo.binding) return null
-    const { binding, mode } = kvInfo
-    let val: any = null
-    if (mode === "blob") {
-      val = await binding.get(JWT_SECRET_KV_KEY)
-    } else {
-      try {
-        val = await binding.get(JWT_SECRET_KV_KEY, "text")
-      } catch {
-        val = await binding.get(JWT_SECRET_KV_KEY)
-      }
-    }
-    if (val && typeof val.text === "function") {
-      val = await val.text()
-    }
-    return val ? String(val) : null
+    // 复用 store/json 的通用密钥读取（已支持 binding/blob/api/proxy 全模式）
+    const { readPersistedSecret } = await import("../internal/model/db")
+    return await readPersistedSecret(env, JWT_SECRET_KV_KEY)
   } catch (e) {
     console.warn("[JWT] Failed to read secret from KV:", e)
     return null
@@ -52,22 +68,8 @@ async function readKvSecret(env: any): Promise<string | null> {
 
 async function writeKvSecret(env: any, secret: string): Promise<boolean> {
   try {
-    const { getKvBinding } = await import("../internal/model/db")
-    const kvInfo = await getKvBinding(env)
-    if (kvInfo.mode === "none" || !kvInfo.binding) return false
-    const { binding, mode } = kvInfo
-    if (mode === "blob") {
-      if (typeof binding.set === "function")
-        await binding.set(JWT_SECRET_KV_KEY, secret)
-      else if (typeof binding.put === "function")
-        await binding.put(JWT_SECRET_KV_KEY, secret)
-    } else {
-      if (typeof binding.put === "function")
-        await binding.put(JWT_SECRET_KV_KEY, secret)
-      else if (typeof binding.set === "function")
-        await binding.set(JWT_SECRET_KV_KEY, secret)
-    }
-    return true
+    const { writePersistedSecret } = await import("../internal/model/db")
+    return await writePersistedSecret(env, JWT_SECRET_KV_KEY, secret)
   } catch (e) {
     console.warn("[JWT] Failed to persist secret to KV:", e)
     return false
@@ -82,23 +84,63 @@ export async function getJwtSecret(c?: Context | any): Promise<string> {
   const env =
     c?.env || (typeof process !== "undefined" ? (process as any).env : {}) || {}
 
-  // 1. 环境变量显式配置（最优先，提高最小长度要求到 32 字符）
-  const envSecret = env.JWT_SECRET
-  if (envSecret && envSecret.length >= 32) {
+  // ── 长度策略：只要求「非空」，32 字符为**推荐值**（不强制）──
+  //
+  // 这里曾有三个互不相同的阈值：env 走 `>=16`、缓存走 `>=32`、持久化走
+  // `>=32`。后果是 **自动生成/持久化的密钥会被读取路径判为无效**：
+  //   setup 写入的密钥若不足 32 字符，第 2 步 `>=32` 判定失败 → 落到第 4 步
+  //   **重新生成**一把新密钥 → 每次冷启动换钥 → 已签发的 token 全部失效、
+  //   多实例间验签互相失败（表现为「登录成功后立刻 401」）。
+  // 也就是说「自动生成」看着写了、实际没生效。现在统一为「非空即有效」，
+  // 与 db.ts:readEnvEncryptionKey 完全一致，保证「写进去的」必定「读得出来」。
+  const useSecret = (s: unknown): string | null =>
+    typeof s === "string" && s.trim().length > 0 ? s : null
+
+  // 1. 环境变量显式配置（最优先）
+  const envSecret = useSecret(env.JWT_SECRET)
+  if (envSecret) {
     return envSecret
   }
 
-  // 兼容性：如果密钥长度在 16-31 之间，发出警告但仍然使用
-  if (envSecret && envSecret.length >= 16) {
-    console.warn(
-      "[JWT] JWT_SECRET 长度不足 32 字符，建议使用更长的密钥以提高安全性。"
+  // 2. 持久化密钥（跨实例/重启稳定），按 env 缓存
+  // 性能修复：命中后直接返回缓存，避免每次调用都回源存储。
+  // 修复前此分支只 `return kvSecret` 而不写缓存，导致
+  // getUserFromContext / csrfProtection / checkAdminAuth 等每请求 2-4 次调用
+  // 都会各自触发一次后端读取（KV/D1 后端下这是最贵的操作之一）。
+  //
+  // 缓存粒度按 env 隔离（readCachedJwtSecret/rememberJwtSecret，见文件头注释），
+  // 判定统一走 useSecret（「非空即有效」），不再用长度阈值。
+  const cached = readCachedJwtSecret(env)
+  if (useSecret(cached)) {
+    return cached as string
+  }
+
+  // 2a. 复用 setup 自动生成的共享密钥（openlist_encryption_secret）。
+  //
+  // 为什么必须放在这里：`ensureEncryptionSecret()` 在 setup 阶段把自动生成的
+  // 密钥写进 **openlist_encryption_secret**，而本函数历史实现只找
+  // **openlist_jwt_secret** —— 两个槽位名不同。于是「自动生成」的那把密钥
+  // 对 JWT 侧**完全不可见**：本函数会再生成一把存到另一个槽位，
+  // 造成同一部署里两把密钥各自漂移（多实例验签失败、冷启动即换钥）。
+  // 约定 JWT 签名与字段加密共用同一把密钥（见 db.ts 的「静态加密」注释块；
+  // 字段加密是否启用由 DB_CIPHER 决定，与密钥来源无关），因此这里
+  // 显式回退读取该槽位，保证「生成了一份」就等于「两边都可用」。
+  try {
+    const sharedSecret = useSecret(
+      await readPersistedSecret(env, ENCRYPTION_SECRET_KV_KEY),
     )
-    return envSecret
+    if (sharedSecret) {
+      rememberJwtSecret(env, sharedSecret)
+      return sharedSecret
+    }
+  } catch {
+    // 读取失败按「无持久化密钥」处理，继续走下面的独立槽位
   }
 
-  // 2. KV 持久化密钥（跨实例/重启稳定）
-  const kvSecret = await readKvSecret(env)
-  if (kvSecret && kvSecret.length >= 32) {
+  // 2b. 独立的 JWT 密钥槽位（历史部署可能已在此写入）
+  const kvSecret = useSecret(await readKvSecret(env))
+  if (kvSecret) {
+    rememberJwtSecret(env, kvSecret)
     return kvSecret
   }
 
@@ -109,10 +151,15 @@ export async function getJwtSecret(c?: Context | any): Promise<string> {
     env.CF_PAGES === "1" ||
     env.WORKERS_ENV === "production"
 
-  // 4. 生成随机密钥并尝试持久化到 KV（开发 + 生产兼容）
-  if (!cachedJwtSecret) {
-    cachedJwtSecret = generateRandomSecret()
-    const persisted = await writeKvSecret(env, cachedJwtSecret)
+  // 4. 生成随机密钥并尝试持久化（开发 + 生产兼容）
+  //
+  // 以**当前 env** 的缓存值判断是否需要生成：同一 env 的重复/并发调用只生成
+  // 一次（这里先同步 remember 再 await 持久化，避免并发各生成一把密钥，导致
+  // 同一时刻签发的 token 互相验不过）。
+  if (!readCachedJwtSecret(env)) {
+    const generated = generateRandomSecret()
+    rememberJwtSecret(env, generated)
+    const persisted = await writeKvSecret(env, generated)
     
     if (isProduction) {
       console.error(
@@ -128,49 +175,55 @@ export async function getJwtSecret(c?: Context | any): Promise<string> {
         (persisted
           ? "密钥已持久化到 KV，重启后保持有效。"
           : "密钥仅存于内存，重启后所有 token 将失效。") +
-        "\n生产环境部署前，请务必配置 >=32 字符的 JWT_SECRET 环境变量。"
+        "\n生产环境部署前，建议配置 32+ 字符的 JWT_SECRET 环境变量（推荐而非强制）。"
       )
     }
   }
-  return cachedJwtSecret
+  // 走到这里一定已有密钥：步骤 2 命中缓存，或步骤 4 刚生成并 remember。
+  return readCachedJwtSecret(env) as string
 }
 
-// ---- JWT 注销黑名单（尽力而为：进程内 Set + KV 持久化）----
-// 说明：Serverless 多实例下各实例独立缓存，KV 持久化仅在冷启动时加载一次，
-// 因此跨实例的「即时」失效不能保证精确，但能在单实例内立即生效，并随新实例
-// 冷启动逐步收敛。exp 过期后条目自动清理，不会无限增长。
+// ---- JWT 注销黑名单（进程内 Set + 统一持久化后端，带 TTL 复核）----
+//
+// 存储层：走统一的 getStorageBackend（经 readPersistedSecret/writePersistedSecret），
+// 覆盖 D1 / MySQL / DO / KV / Blob，而**不再**只探测 KV binding。
+//   历史缺陷：只调用 getKvBinding，而该探测没有 D1 分支。于是在 D1 部署下注销
+//   名单「读不到也写不进」——同一实例内靠内存 Set 生效，跨实例完全失效，
+//   也就是「退出登录只在自己这一台机器上有效」。
+//
+// 刷新：带 TTL 周期回读，让其他实例的注销在有限时间内收敛；本实例的注销
+// 仍然是立即生效（先写内存 Set，再落盘）。
+// 精确性边界：Serverless 多实例下不保证「瞬时」全局一致，这是有意的权衡；
+// 需要更强保证时应改用短 TTL 的强制撤销或服务端会话表。
 const REVOKED_KV_KEY = "openlist_revoked_tokens"
+const REVOKED_RELOAD_MS = 30_000
 const revokedJtis = new Set<string>()
-let revokedLoaded = false
+let revokedLoadedAt = 0
+let revokedInflight: Promise<void> | null = null
 
 async function ensureRevokedLoaded(env: any): Promise<void> {
-  if (revokedLoaded) return
-  revokedLoaded = true
-  try {
-    const { getKvBinding } = await import("../internal/model/db")
-    const kvInfo = await getKvBinding(env)
-    if (kvInfo.mode === "none" || !kvInfo.binding) return
-    const { binding, mode } = kvInfo
-    let val: any = null
-    if (mode === "blob") {
-      val = await binding.get(REVOKED_KV_KEY)
-    } else {
-      try {
-        val = await binding.get(REVOKED_KV_KEY, "text")
-      } catch {
-        val = await binding.get(REVOKED_KV_KEY)
+  if (Date.now() - revokedLoadedAt < REVOKED_RELOAD_MS) return
+  if (revokedInflight) return revokedInflight
+  revokedInflight = (async () => {
+    try {
+      const { readPersistedSecret } = await import("../internal/model/db")
+      const raw = await readPersistedSecret(env, REVOKED_KV_KEY)
+      if (raw) {
+        const arr = JSON.parse(String(raw))
+        const now = Math.floor(Date.now() / 1000)
+        for (const item of arr) {
+          if (item && item.jti && item.exp > now) revokedJtis.add(item.jti)
+        }
       }
+    } catch {
+      // 黑名单读取失败时降级为不拦截（不影响登录）
+    } finally {
+      // 无论成功失败都推迟下次回读，避免存储故障时被反复打爆
+      revokedLoadedAt = Date.now()
+      revokedInflight = null
     }
-    if (val && typeof val.text === "function") val = await val.text()
-    if (!val) return
-    const arr = JSON.parse(String(val))
-    const now = Math.floor(Date.now() / 1000)
-    for (const item of arr) {
-      if (item && item.jti && item.exp > now) revokedJtis.add(item.jti)
-    }
-  } catch {
-    // 黑名单加载失败时降级为不拦截（不影响登录）
-  }
+  })()
+  return revokedInflight
 }
 
 export async function revokeToken(
@@ -179,47 +232,36 @@ export async function revokeToken(
   env: any,
 ): Promise<void> {
   if (!jti) return
+  // 本实例立即生效
   revokedJtis.add(jti)
   try {
-    const { getKvBinding } = await import("../internal/model/db")
-    const kvInfo = await getKvBinding(env)
-    if (kvInfo.mode === "none" || !kvInfo.binding) return
-    const { binding, mode } = kvInfo
+    const { readPersistedSecret, writePersistedSecret } = await import(
+      "../internal/model/db"
+    )
     let arr: Array<{ jti: string; exp: number }> = []
-    if (mode === "blob") {
-      const val = await binding.get(REVOKED_KV_KEY)
-      if (val) arr = typeof val === "string" ? JSON.parse(val) : val
-    } else {
+    const raw = await readPersistedSecret(env, REVOKED_KV_KEY)
+    if (raw) {
       try {
-        const val = await binding.get(REVOKED_KV_KEY, "text")
-        if (val) arr = JSON.parse(String(val))
+        const parsed = JSON.parse(String(raw))
+        if (Array.isArray(parsed)) arr = parsed
       } catch {
-        const val = await binding.get(REVOKED_KV_KEY)
-        if (val) arr = typeof val === "string" ? JSON.parse(val) : val
+        arr = []
       }
     }
     const now = Math.floor(Date.now() / 1000)
-    arr = arr.filter((i) => i && i.exp > now)
-    arr.push({ jti, exp })
-    const payload = JSON.stringify(arr)
-    if (mode === "blob") {
-      if (typeof binding.set === "function")
-        await binding.set(REVOKED_KV_KEY, payload)
-      else if (typeof binding.put === "function")
-        await binding.put(REVOKED_KV_KEY, payload)
-    } else {
-      if (typeof binding.put === "function")
-        await binding.put(REVOKED_KV_KEY, payload)
-      else if (typeof binding.set === "function")
-        await binding.set(REVOKED_KV_KEY, payload)
-    }
+    // exp 过期的条目自动淘汰，列表不会无限增长
+    arr = arr.filter((i) => i && i.jti && i.exp > now)
+    if (!arr.some((i) => i.jti === jti)) arr.push({ jti, exp })
+    await writePersistedSecret(env, REVOKED_KV_KEY, JSON.stringify(arr))
   } catch (e) {
-    console.warn("[JWT] Failed to persist revoked token to KV:", e)
+    console.warn("[JWT] Failed to persist revoked token:", e)
   }
 }
 
 export async function isTokenRevoked(jti: string, env: any): Promise<boolean> {
   if (!jti) return false
+  // 本实例的注销无需等待回读即可生效
+  if (revokedJtis.has(jti)) return true
   await ensureRevokedLoaded(env)
   return revokedJtis.has(jti)
 }
@@ -251,15 +293,15 @@ function timingSafeEqual(a: string, b: string): boolean {
 
 /**
  * 定时调度鉴权通道：EdgeOne Schedules 只能携带 path/method/payload，
- * 无法附加 Authorization 头。当环境变量 CRON_SECRET 已设置时，
+ * 无法附加 Authorization 头。复用 JWT_SECRET 作为调度密钥，
  * 允许请求通过 query（?cron_secret=）、JSON body { cron_secret }
  * 或 X-Cron-Secret 头携带匹配值触发受保护的任务接口。
  */
 export async function matchCronSecret(c: Context): Promise<boolean> {
   const env = (c as any)?.env || {}
   const secret =
-    env.CRON_SECRET ||
-    (typeof process !== "undefined" ? process.env?.CRON_SECRET : "")
+    env.JWT_SECRET ||
+    (typeof process !== "undefined" ? process.env?.JWT_SECRET : "")
   if (!secret || typeof secret !== "string") return false
 
   const header = c.req.header("x-cron-secret")
@@ -489,6 +531,8 @@ export async function getUserFromContext(c: Context): Promise<{
       (u: any) => u.id === payload.id || u.username === payload.username,
     )
     if (!user || user.disabled) return null
+    // 密码指纹：改密后旧令牌立即失效（对齐 Go middlewares.Auth 的 PwdTS 比对）
+    if (!isPasswordStampValid(payload, user)) return null
     return {
       id: user.id,
       role: user.role,

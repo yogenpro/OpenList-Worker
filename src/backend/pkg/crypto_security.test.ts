@@ -1,7 +1,13 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { Hono } from "hono"
-import { encrypt, decrypt } from "./crypto"
+import {
+  decrypt,
+  decryptConfigValue,
+  deriveConfigEncryptionKey,
+  encrypt,
+  encryptConfigValue,
+} from "./crypto"
 import { hashPasswordSHA256, authRouter, getOrInitUsers } from "../server/auth"
 import { saveDb, getDb } from "../internal/model/db"
 
@@ -58,6 +64,16 @@ test("AES decrypt backwards compatibility with 2-segment legacy format", async (
   )
 })
 
+test("config encryption reuses one derived key with independent IVs", async () => {
+  const key = await deriveConfigEncryptionKey("my-test-secret-key-123456")
+  const first = await encryptConfigValue("first-secret", key)
+  const second = await encryptConfigValue("second-secret", key)
+
+  assert.notEqual(first.split(":")[0], second.split(":")[0])
+  assert.equal(await decryptConfigValue(first, key), "first-secret")
+  assert.equal(await decryptConfigValue(second, key), "second-secret")
+})
+
 test("StaticHash produces consistent 64-char sha256 output (Go StaticHash)", async () => {
   const hash = await hashPasswordSHA256("admin")
   assert.equal(typeof hash, "string")
@@ -67,9 +83,9 @@ test("StaticHash produces consistent 64-char sha256 output (Go StaticHash)", asy
 
 test("getOrInitUsers preserves a legacy PBKDF2 admin hash instead of silently resetting to admin/admin", async () => {
   const env: any = {}
-  // 隔离 CI 环境变量：若 CI 设置了 ADMIN_PASSWORD，getOrInitUsers 会优先取
-  // process.env.ADMIN_PASSWORD，导致断言失败
-  delete process.env.ADMIN_PASSWORD
+  // 隔离 CI 环境变量：若 CI 设置了 ADMIN_PASS，getOrInitUsers 会优先取
+  // process.env.ADMIN_PASS，导致断言失败
+  delete process.env.ADMIN_PASS
   // Simulate leftover from the PBKDF2 build (PR #33 era): stored hash is
   // `pbkdf2:100000:<salt>:<hash>`, unverifiable by the current SHA-256 scheme.
   const fakePdkdf2Hash = `pbkdf2:100000:${"a".repeat(64)}:${"b".repeat(64)}`

@@ -16,6 +16,18 @@
  * 所有列名统一用反引号包裹（SQLite 与 MySQL 均支持）。
  */
 
+/**
+ * 参与数据往返（load/save）的表。
+ *
+ * 这些表的内容由 `db.ts` 的配置对象持有，全量读写是有意义的。
+ *
+ * 注意：**不包含 sshkeys**。TS 侧 SSH 公钥存在 `user.ssh_keys` 内，
+ * 从不读写顶层的 `db.sshkeys`；而 Go 后端把公钥存于独立的
+ * `x_ssh_public_keys` 表。若把 sshkeys 纳入往返，`sqlFormat.save()` 会执行
+ * `DELETE FROM x_ssh_public_keys` 再写入空数组，**清空 Go 写入的 SSH 公钥**。
+ * 因此这里刻意排除，只保留其 DDL（见 TABLES），与 Go 共享同一物理库时
+ * 既不破坏也不接管该表。
+ */
 export const TABLE_NAMES = [
   "settings",
   "storages",
@@ -23,10 +35,18 @@ export const TABLE_NAMES = [
   "shares",
   "metas",
   "plugins",
-  "sshkeys",
 ] as const
 
 export type TableName = (typeof TABLE_NAMES)[number]
+
+/**
+ * 需要建表（DDL）的全部表，含不参与往返的 sshkeys。
+ *
+ * 与 TABLE_NAMES 分离：建表仍覆盖 sshkeys，便于与 Go 后端共享物理库时
+ * 表结构一致；但读写（load/save/batch）只针对 TABLE_NAMES。
+ */
+export const DDL_TABLE_NAMES = [...TABLE_NAMES, "sshkeys"] as const
+export type DdlTableName = (typeof DDL_TABLE_NAMES)[number]
 
 /** 字段类型（决定序列化与 SQL 列类型）。 */
 export type FieldType = "string" | "number" | "bool" | "json" | "date"
@@ -49,15 +69,18 @@ export interface ColumnDef {
 
 /** 表定义。 */
 export interface TableDef {
-  name: TableName
+  name: DdlTableName
   columns: ColumnDef[]
 }
 
 /**
  * 每张表的主键对应的「对象字段名」（用于从实体对象提取主键值）。
  * 供 key 格式（分 key 存储）与 SQL 格式共用。
+ *
+ * 覆盖全部 DDL 表（含 sshkeys），以便建表与反射逻辑完整；
+ * 参与往返的表由 TABLE_NAMES 决定。
  */
-export const TABLE_KEY: Record<TableName, string> = {
+export const TABLE_KEY: Record<DdlTableName, string> = {
   settings: "key",
   storages: "id",
   users: "id",
@@ -73,22 +96,6 @@ export function keyOf(table: TableName, entity: any): string {
 }
 
 /**
- * 附加索引列（主键之外冗余存储的常用查询字段）。
- *
- * @deprecated 仅供旧版宽表后端（store/d1.ts、store/mysql.ts）使用。新的
- * 列式表（TABLES）已把每个字段独立成列，不再需要该映射。保留仅为兼容遗留代码。
- */
-export const TABLE_EXTRA_COLUMNS: Record<TableName, string[]> = {
-  settings: [],
-  storages: ["mount_path"],
-  users: ["username"],
-  shares: [],
-  metas: ["path"],
-  plugins: [],
-  sshkeys: ["user_id"],
-}
-
-/**
  * 完整列式表定义。
  *
  * 字段与 Go 后端模型一一对应（json tag）：
@@ -99,7 +106,7 @@ export const TABLE_EXTRA_COLUMNS: Record<TableName, string[]> = {
  *   - metas    ← model.Meta
  *   - plugins  ← TS 独有（Go 无插件表）
  */
-export const TABLES: Record<TableName, TableDef> = {
+export const TABLES: Record<DdlTableName, TableDef> = {
   settings: {
     name: "settings",
     columns: [
@@ -261,7 +268,7 @@ export const TABLES: Record<TableName, TableDef> = {
  *
  * plugins 为 TS 独有（Go 无插件表），沿用复数名 plugins。
  */
-export const TABLE_SQL_NAMES: Record<TableName, string> = {
+export const TABLE_SQL_NAMES: Record<DdlTableName, string> = {
   settings: "setting_items",
   storages: "storages",
   users: "users",
@@ -272,17 +279,16 @@ export const TABLE_SQL_NAMES: Record<TableName, string> = {
 }
 
 /**
- * 读取表前缀（对齐 Go 的 TABLE_PREFIX，默认 "x_"）。
+ * 表前缀，固定为 "x_"（对齐 Go 后端的默认值）。
  */
-export function getTablePrefix(env?: any): string {
-  const e = env || (typeof process !== "undefined" ? process.env : {}) || {}
-  return String(e?.TABLE_PREFIX || "x_")
+export function getTablePrefix(_env?: any): string {
+  return "x_"
 }
 
 /**
  * 返回某张表在 SQL 中的完整表名（前缀 + 复数名）。
  */
-export function tableSqlName(table: TableName, env?: any): string {
+export function tableSqlName(table: DdlTableName, env?: any): string {
   return getTablePrefix(env) + TABLE_SQL_NAMES[table]
 }
 
@@ -364,7 +370,7 @@ export function deserializeColumn(col: ColumnDef, value: any): any {
  * 输出这些字段，避免 roundtrip 后对象被注入大量 null 键（与 map/key 格式
  * 的对象形态保持一致）。
  */
-export function rowToEntity(table: TableName, row: any): any {
+export function rowToEntity(table: DdlTableName, row: any): any {
   const def = TABLES[table]
   const out: any = {}
   for (const col of def.columns) {
@@ -380,7 +386,7 @@ export function rowToEntity(table: TableName, row: any): any {
 /**
  * 将对象转换为 INSERT 的列与参数。
  */
-export function entityToRow(table: TableName, entity: any): {
+export function entityToRow(table: DdlTableName, entity: any): {
   columns: string[]
   values: any[]
 } {
@@ -450,12 +456,13 @@ function buildSchemaInfoDdl(dialect: "sqlite" | "mysql"): string {
 }
 
 /**
- * 生成完整的建表语句数组（幂等）。表名前缀由 TABLE_PREFIX 环境变量决定
- * （默认 "x_"，对齐 Go），复数表名对齐 Go 的 GORM 命名策略。
+ * 生成完整的建表语句数组（幂等）。表名固定为 "x_" 前缀（对齐 Go），
+ * 复数表名对齐 Go 的 GORM 命名策略。
  */
 export function buildDdl(dialect: "sqlite" | "mysql", env?: any): string[] {
   const out: string[] = [buildSchemaInfoDdl(dialect)]
-  for (const name of TABLE_NAMES) {
+  // 建表覆盖全部 DDL 表（含不参与往返的 sshkeys），保证与 Go 共享库时结构一致
+  for (const name of DDL_TABLE_NAMES) {
     out.push(buildTableDdl(TABLES[name], dialect, tableSqlName(name, env)))
   }
   return out
@@ -480,3 +487,86 @@ export const KV_SCHEMA_SQLITE: string[] = [
 export const KV_SCHEMA_MYSQL: string[] = [
   "CREATE TABLE IF NOT EXISTS `kv` (`key` VARCHAR(512) PRIMARY KEY, `value` LONGTEXT NOT NULL)",
 ]
+
+/**
+ * singleflight 协调表的逻辑名（不含 `x_` 前缀）。
+ *
+ * 与 Go 后端**无对应表**：Go 是单进程模型，`golang.org/x/sync/singleflight`
+ * 只需进程内 Map；TS 侧一个部署会同时跑多个 isolate/实例，进程内 Map 无法
+ * 互相看见，因此需要一张共享表来做跨实例的单飞协调（见 pkg/singleflight.ts）。
+ */
+export const SINGLEFLIGHT_TABLE = "singleflight"
+
+/** singleflight 表的完整 SQL 表名（含 `x_` 前缀）。 */
+export function singleflightTableName(env?: any): string {
+  return getTablePrefix(env) + SINGLEFLIGHT_TABLE
+}
+
+/**
+ * 生成 singleflight 协调表的建表语句（SQLite / Cloudflare D1 / Durable Object、
+ * MySQL 方言）。
+ *
+ * 列语义：
+ *   - `key`        去重键（调用方给定，如 `fs.list:1:/movies`）
+ *   - `owner`      执行者实例标识；只有 owner 能写回结果（防止被接管后串写）
+ *   - `state`      running | done | error
+ *   - `started_at` 开始时间（epoch ms，诊断用）
+ *   - `expires_at` 过期时间（epoch ms）：running 超时表示执行者疑似崩溃，
+ *                  可被其他实例接管；done/error 则是结果交接窗口的截止时间
+ *   - `result`     成功结果的 JSON 序列化（仅 done 有值）
+ *   - `error`      失败原因文本（仅 error 有值）
+ *
+ * 注意：该表存的是**运行时在途记录**，绝不参与 db.ts 的配置往返，
+ * 因此刻意不放进 TABLE_NAMES —— 否则 sqlFormat.save() 的整表 DELETE
+ * 会在每次保存配置时把正在执行中的单飞记录清空。
+ *
+ * 与 KV_SCHEMA / buildDdl 并列，由各 SQL 驱动在 ensureSchema 时一并执行。
+ * 非 SQL 驱动（KV / Blob / 内存）没有该表，此时 singleflight 自动退回内存级。
+ *
+ * 表名与索引名都在调用时经 `getTablePrefix(env)` 生成（而非模块加载期的常量）：
+ * 多部署共用一个物理库、靠前缀隔离时，第二个部署的表与索引才能各自正确创建，
+ * 索引名若不带前缀会被首个部署的 `CREATE INDEX IF NOT EXISTS` 静默跳过。
+ */
+export function buildSingleFlightDdl(
+  dialect: "sqlite" | "mysql",
+  env?: any,
+): string[] {
+  const table = quote(singleflightTableName(env))
+  const createTable =
+    dialect === "mysql"
+      ? `CREATE TABLE IF NOT EXISTS ${table} (` +
+        [
+          `${quote("key")} VARCHAR(512) PRIMARY KEY`,
+          `${quote("owner")} VARCHAR(128) NOT NULL`,
+          `${quote("state")} VARCHAR(16) NOT NULL`,
+          `${quote("started_at")} BIGINT NOT NULL`,
+          `${quote("expires_at")} BIGINT NOT NULL`,
+          `${quote("result")} LONGTEXT`,
+          `${quote("error")} LONGTEXT`,
+        ].join(", ") +
+        `)`
+      : `CREATE TABLE IF NOT EXISTS ${table} (` +
+        [
+          `${quote("key")} TEXT PRIMARY KEY`,
+          `${quote("owner")} TEXT NOT NULL`,
+          `${quote("state")} TEXT NOT NULL`,
+          `${quote("started_at")} INTEGER NOT NULL`,
+          `${quote("expires_at")} INTEGER NOT NULL`,
+          `${quote("result")} TEXT`,
+          `${quote("error")} TEXT`,
+        ].join(", ") +
+        `)`
+
+  if (dialect === "mysql") {
+    // MySQL 不支持 `CREATE INDEX IF NOT EXISTS`，而索引缺失只影响过期行的回收效率
+    // （建表失败会中断整个 init），因此这里刻意不建索引。
+    return [createTable]
+  }
+
+  // 回收过期行（崩溃残留 / 交接窗口结束）按 expires_at 过滤，走索引避免全表扫。
+  return [
+    createTable,
+    `CREATE INDEX IF NOT EXISTS ${quote(getTablePrefix(env) + "idx_singleflight_expires")} ` +
+      `ON ${table} (${quote("expires_at")})`,
+  ]
+}

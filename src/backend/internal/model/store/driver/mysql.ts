@@ -4,11 +4,11 @@
  * 通过 mysql2/promise 动态加载，仅在 Node.js 运行时可用。
  * 
  * 环境变量：
- * - MYSQL_URL / DATABASE_URL（优先）
- * - MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE
+ * - MYSQL_URLS（优先，连接串）
+ * - MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASS, MYSQL_NAME
  */
 import type { Driver } from "../types"
-import { buildDdl, getTablePrefix, KV_SCHEMA_MYSQL } from "../schema"
+import { buildDdl, buildSingleFlightDdl, getTablePrefix, KV_SCHEMA_MYSQL } from "../schema"
 
 function isNode(): boolean {
   return typeof process !== "undefined" && process.release?.name === "node"
@@ -16,7 +16,7 @@ function isNode(): boolean {
 
 function getMysqlConfig(env: any): any | null {
   const e = env || (typeof process !== "undefined" ? process.env : {}) || {}
-  const url = e?.MYSQL_URL || e?.DATABASE_URL
+  const url = e?.MYSQL_URLS
   if (url) return url
 
   const host = e?.MYSQL_HOST
@@ -25,8 +25,8 @@ function getMysqlConfig(env: any): any | null {
     host,
     port: Number(e?.MYSQL_PORT || 3306),
     user: e?.MYSQL_USER || "",
-    password: e?.MYSQL_PASSWORD || "",
-    database: e?.MYSQL_DATABASE || "",
+    password: e?.MYSQL_PASS || "",
+    database: e?.MYSQL_NAME || "",
   }
 }
 
@@ -52,8 +52,12 @@ let _schemaInitedPrefix: string | null = null
 async function ensureSchema(pool: any, env?: any): Promise<void> {
   const prefix = getTablePrefix(env)
   if (_schemaInitedPrefix === prefix) return
-  // KV 表（map/key 格式）+ 列式表（sql 格式）一并创建
-  for (const ddl of [...KV_SCHEMA_MYSQL, ...buildDdl("mysql", env)]) {
+  // KV 表（map/key 格式）+ 列式表（sql 格式）+ singleflight 协调表一并创建
+  for (const ddl of [
+    ...KV_SCHEMA_MYSQL,
+    ...buildDdl("mysql", env),
+    ...buildSingleFlightDdl("mysql", env),
+  ]) {
     await pool.query(ddl)
   }
   _schemaInitedPrefix = prefix
@@ -175,7 +179,7 @@ export const mysqlDriver: Driver = {
         connected: false,
         platform: "MySQL (mysql2)",
         mode: "mysql",
-        error: "MySQL config not found (expected MYSQL_URL or MYSQL_HOST)",
+        error: "MySQL config not found (expected MYSQL_URLS or MYSQL_HOST)",
       }
     }
     

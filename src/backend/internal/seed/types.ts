@@ -1,6 +1,8 @@
 export const SEED_FORMAT = "openlist-sharing-seed" as const
 export const SEED_VERSION = 1 as const
 export const DEFAULT_PIECE_SIZE = 10 * 1024 * 1024
+/** Legacy default cloud drive id used when no explicit cloud is recorded. */
+export const DEFAULT_CAS_CLOUD = "189" as const
 
 export type SeedFormat = "oss" | "torrent" | "cas"
 export type SeedHashAlgorithm = "md5" | "sha1" | "sha256"
@@ -21,6 +23,8 @@ export interface SeedHashes {
   md5: string
   sha1: string
   sha256: string
+  /** GCID used by Thunder/PikPak rapid upload; preserved from Go seeds. */
+  gcid?: string
   pieces: Record<SeedHashAlgorithm, string[]>
 }
 
@@ -33,6 +37,11 @@ export interface SeedFile {
   sources: SeedSource[]
   cas_slice_md5: string
   cas_create_time: string
+  /**
+   * Identifies the cloud drive whose CAS slice rule this metadata follows
+   * (e.g. "189", "115", "aliyundrive_open"). Empty means "189" (legacy default).
+   */
+  cas_cloud: string
   missing_channels: string[]
 }
 
@@ -57,6 +66,8 @@ export interface CasFileEntry {
   create_time: string
   slice_md5s?: string[]
   slice_size?: number
+  /** Cloud drive identifier (e.g. "189"); empty means "189". */
+  cloud?: string
 }
 
 export interface CasPayload {
@@ -67,6 +78,8 @@ export interface CasPayload {
   create_time: string
   slice_md5s?: string[]
   slice_size?: number
+  /** Cloud drive identifier (e.g. "189"); empty means "189". */
+  cloud?: string
   files?: CasFileEntry[]
 }
 
@@ -115,6 +128,14 @@ function normalizeHash(value: unknown, algorithm: SeedHashAlgorithm): string {
   const hash = text(value).toLowerCase()
   if (hash && !new RegExp(`^[0-9a-f]{${HEX_LENGTHS[algorithm]}}$`).test(hash)) {
     throw new Error(`Invalid ${algorithm} hash`)
+  }
+  return hash
+}
+
+function normalizeGcid(value: unknown): string {
+  const hash = text(value).toLowerCase()
+  if (hash && !/^[0-9a-f]{40}$/.test(hash)) {
+    throw new Error("Invalid gcid hash")
   }
   return hash
 }
@@ -174,6 +195,7 @@ export function normalizeSeed(input: unknown): SharingSeed {
       throw new Error("Invalid seed file size")
     const hashes = file.hashes || {}
     const pieces = hashes.pieces || {}
+    const gcid = normalizeGcid(hashes.gcid)
     const expectedPieces = size > 0 ? Math.ceil(size / pieceSize) : 0
     const normalizedPieces = (algorithm: SeedHashAlgorithm): string[] => {
       if (!Array.isArray(pieces[algorithm])) return []
@@ -196,6 +218,7 @@ export function normalizeSeed(input: unknown): SharingSeed {
         md5: normalizeHash(hashes.md5, "md5"),
         sha1: normalizeHash(hashes.sha1, "sha1"),
         sha256: normalizeHash(hashes.sha256, "sha256"),
+        ...(gcid ? { gcid } : {}),
         pieces: {
           md5: normalizedPieces("md5"),
           sha1: normalizedPieces("sha1"),
@@ -205,6 +228,7 @@ export function normalizeSeed(input: unknown): SharingSeed {
       sources: normalizeSources(file.sources),
       cas_slice_md5: normalizeHash(file.cas_slice_md5, "md5"),
       cas_create_time: text(file.cas_create_time),
+      cas_cloud: text(file.cas_cloud).trim(),
       missing_channels: Array.isArray(file.missing_channels)
         ? file.missing_channels.map(text).filter(Boolean)
         : [],
@@ -309,6 +333,7 @@ export function applyHashMatrix(
     md5: matrix.md5.whole ? file.hashes.md5 : "",
     sha1: matrix.sha1.whole ? file.hashes.sha1 : "",
     sha256: matrix.sha256.whole ? file.hashes.sha256 : "",
+    ...(file.hashes.gcid ? { gcid: file.hashes.gcid } : {}),
     pieces: {
       md5: matrix.md5.pieces ? file.hashes.pieces.md5 : [],
       sha1: matrix.sha1.pieces ? file.hashes.pieces.sha1 : [],
