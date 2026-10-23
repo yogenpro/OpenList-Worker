@@ -198,5 +198,15 @@
   },
   "lint-staged": {
     "**/*.{js,ts,css,tsx,jsx,md,html,yml,yaml}": "prettier --write"
+  },
+  "pnpm": {
+    "overrides": {
+      "ws@8": "8.21.0",
+      "@fastify/busboy@<3.2.2": "3.2.2",
+      "@vue/server-renderer@<3.5.42": "3.5.42",
+      "dompurify@<3.4.17": "3.4.17",
+      "katex@<0.18.2": "0.18.2",
+      "undici@<6.28.1": "6.28.1"
+    }
   }
 }
